@@ -63,6 +63,12 @@ agent = "{default}"
 # select"). Off by default: select, then copy explicitly with cmd+c.
 copy_on_select = false
 
+# Rejoin rows an app hard-wrapped when you copy them: agent CLIs break a long
+# path to fit their own layout box and indent the rest, so copying it gives
+# you a newline mid-path. Only rows that reached the edge and continue onto an
+# indented row are joined. Off copies exactly what is on screen.
+# copy_unwrap = true
+
 # List your own open GitHub PRs in a sidebar section, and check one out as a
 # worktree by clicking it. Off by default; needs gh, authenticated.
 # monitor_prs = false
@@ -147,6 +153,8 @@ pub struct ConfigFile {
     pub pane_titles: bool,
     /// Mouse selections copy to the clipboard as soon as they finish.
     pub copy_on_select: bool,
+    /// Rejoin rows an app hard-wrapped when copying (see `unwrap_wrapped`).
+    pub copy_unwrap: bool,
     /// List the user's own open GitHub PRs in the sidebar (needs gh).
     pub monitor_prs: bool,
     /// Fire saved automations on their schedules, and show the sidebar's
@@ -196,6 +204,7 @@ impl Default for ConfigFile {
             min_contrast: 3.0,
             pane_titles: true,
             copy_on_select: false,
+            copy_unwrap: true,
             monitor_prs: false,
             automations: false,
             git_status: true,
@@ -231,6 +240,7 @@ pub struct Style {
     pub agent: &'static Agent,
     pub pane_titles: bool,
     pub copy_on_select: bool,
+    pub copy_unwrap: bool,
     pub monitor_prs: bool,
     pub automations: bool,
     pub min_contrast: f32,
@@ -369,6 +379,7 @@ pub fn resolve(
             agent,
             pane_titles: cfg.pane_titles,
             copy_on_select: cfg.copy_on_select,
+            copy_unwrap: cfg.copy_unwrap,
             monitor_prs: cfg.monitor_prs,
             automations: cfg.automations,
             min_contrast: cfg.min_contrast,

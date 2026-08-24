@@ -146,6 +146,12 @@ pub struct App {
     pr_preview: Option<pr_view::Preview>,
     pr_text_tx: Sender<(String, u64, Result<String, String>)>,
     pr_text_rx: Receiver<(String, u64, Result<String, String>)>,
+    /// Rejoin rows a TUI hard-wrapped when copying (config `copy_unwrap`).
+    copy_unwrap: bool,
+    /// A copy muxterm asked tmux for, waiting on its OSC 52 answer: the pane
+    /// and the width its content was wrapped against. Only this copy gets
+    /// un-wrapped; a program's own OSC 52 passes through untouched.
+    pending_copy: Option<(PaneId, u16)>,
     /// Fire saved automations on their schedules (config `automations`).
     /// Off leaves the list saved but inert, and hides the sidebar section.
     automations_on: bool,
@@ -435,6 +441,8 @@ impl App {
             pr_preview: None,
             pr_text_tx,
             pr_text_rx,
+            copy_unwrap: style.copy_unwrap,
+            pending_copy: None,
             automations_on: style.automations,
             automations: Vec::new(),
             automations_collapsed: false,
@@ -2731,8 +2739,22 @@ impl App {
                         pane.title = "shell".into();
                     }
                 },
-                // tmux copy-mode copies arrive here as OSC 52.
-                PtyEvent::ClipboardStore(_, data) => ctx.copy_text(data),
+                // tmux copy-mode copies arrive here as OSC 52. Only one
+                // muxterm *asked* for is un-wrapped: a program in the pane
+                // doing its own OSC 52 copy is sending exact bytes, and
+                // rewriting those would be a bug, not a courtesy.
+                PtyEvent::ClipboardStore(_, data) => {
+                    let ours = self
+                        .pending_copy
+                        .take_if(|(id, _)| *id == PaneId(backend_id));
+                    let text = match (ours, self.copy_unwrap) {
+                        (Some((_, width)), true) => {
+                            unwrap_wrapped(&data, width as usize)
+                        },
+                        _ => data,
+                    };
+                    ctx.copy_text(text);
+                },
                 // Terminal query responses (DA, DSR, ...) must be written
                 // back to the PTY; the widget never handles these itself.
                 PtyEvent::PtyWrite(text) => {
@@ -3658,6 +3680,13 @@ impl App {
             // widget's expands across wrapped rows, which is the multi-line
             // band that appears while only the word actually copies.
             self.word_clear = Some((drag.pane, done));
+            if finish == tmux::Finish::CopyAndCancel {
+                // copy_on_select: the copy is already on its way, so claim
+                // its OSC 52 answer for the un-wrap the same way cmd+c does.
+                let width =
+                    self.tmux.cursor_and_size(&drag.session).map(|(_, w, _)| w);
+                self.pending_copy = width.map(|w| (drag.pane, w));
+            }
             if finish != tmux::Finish::CopyAndCancel {
                 if let Some(pane) = self
                     .tabs
@@ -3769,9 +3798,12 @@ impl App {
         let Some(pane) = tab.panes.get(&tab.focused) else {
             return;
         };
-        // A local (shift+drag) selection is the terminal widget's to copy.
-        if pane.backend.last_content().selectable_range.is_some() {
-            return;
+        let local = pane.backend.last_content().selectable_range.is_some();
+        match copy_source(pane.copy_sel, local) {
+            // A local-only selection (shift+drag) is the widget's to copy:
+            // tmux has no selection to ask for.
+            CopySource::Widget => return,
+            CopySource::Tmux | CopySource::AskTmux => {},
         }
         let session = pane.session.clone();
         let pane_id = tab.focused;
@@ -3781,9 +3813,30 @@ impl App {
         // also how the pane gets its live view back after a cmd+c.
         let ours = pane.copy_sel;
         if ours || self.tmux.selection_present(&session) {
+            // The width the pane's content was wrapped against, for the
+            // un-wrap. One blocking tmux call, on a keystroke the user just
+            // made - the same budget `selection_present` above already
+            // spends.
+            let width = self.tmux.cursor_and_size(&session).map(|(_, w, _)| w);
+            self.pending_copy = width.map(|w| (pane_id, w));
             self.tmux.copy_selection(&session);
         }
         if ours {
+            // The Copy event is deliberately left in place for the widget.
+            //
+            // It looks like a race - the widget copies the local selection
+            // now, tmux's answer overwrites it a frame or two later - and it
+            // is one, but it resolves the right way round and it is
+            // load-bearing. tmux's side of a selection is committed
+            // asynchronously (a spawned `select_update`, which reports
+            // through a done flag), so a cmd+c can reach
+            // `copy-selection-and-cancel` before the range it is meant to
+            // copy has landed - and tmux then copies nothing and sends no
+            // OSC 52 back. Removing the event to tidy the race away is what
+            // turned that into cmd+c silently doing nothing at all
+            // (2026-08-23). The widget's copy is the floor; the OSC 52
+            // raises it to the un-wrapped text when it arrives. A wrapped
+            // line is a much smaller failure than an empty clipboard.
             if let Some(pane) = self
                 .tabs
                 .get_mut(self.active)
@@ -5820,6 +5873,119 @@ fn in_workspace_list(ws: &Workspace) -> bool {
     !ws.is_automation()
 }
 
+/// Gutter glyphs a boxed TUI prefixes its wrapped rows with - codex `| `,
+/// claude code `⎿ `, tree-drawn `└ `/`├ `/`│ `. The same set egui_term's
+/// link joiner treats as chrome (patch P27), kept in step with it.
+fn is_gutter(c: char) -> bool {
+    matches!(c, '|' | '⎿') || ('\u{2500}'..='\u{259F}').contains(&c)
+}
+
+/// A wrapped row's continuation, with its indent and gutter removed - the
+/// chrome the emitter added, which was never part of the text.
+fn strip_continuation(line: &str) -> &str {
+    line.trim_start().trim_start_matches(is_gutter).trim_start()
+}
+
+/// How far short of the pane width a row may stop and still read as "ran
+/// out of room": a TUI wraps inside its own box, so its content stops a few
+/// columns early. Generous enough for a border plus a gutter, tight enough
+/// that an ordinary short line is never mistaken for a wrap.
+const WRAP_SLACK: usize = 8;
+
+/// Did `prev` run out of room and continue onto `next`?
+///
+/// All three conditions carry weight. The row must have reached the edge -
+/// otherwise the emitter chose to break there. It must not end in
+/// whitespace, because a real wrap breaks mid-content. And the continuation
+/// must be indented or gutter-prefixed: that is the rule egui_term's link
+/// joiner rests on (P20), and it is what keeps a flush-left column of paths
+/// - `ls` output, a find listing - from being glued into one line.
+fn wraps_onto(prev: &str, prev_len: usize, next: &str, width: usize) -> bool {
+    if prev.is_empty() || prev_len + WRAP_SLACK < width {
+        return false;
+    }
+    if prev.ends_with(char::is_whitespace) {
+        return false;
+    }
+    let indented = next
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_whitespace() || is_gutter(c));
+    indented && !strip_continuation(next).is_empty()
+}
+
+/// Rejoin rows a TUI hard-wrapped, for copied text.
+///
+/// tmux already joins *soft* wraps (the terminal ran the line off the edge
+/// itself), so what is left are the breaks an app put in deliberately to fit
+/// its own layout box - Claude Code stopping a long path short of the edge
+/// and indenting the rest. Those are invisible in the grid: nothing marks
+/// them, which is why this is a guess rather than a lookup, and why the
+/// conditions in `wraps_onto` are deliberately narrow.
+///
+/// The unavoidable trade: the link joiner can afford a wrong guess because
+/// the app existence-checks each candidate and discards the bad ones, but a
+/// copy has nothing to check against. So this errs toward leaving text
+/// alone, and `copy_unwrap = false` turns it off entirely.
+fn unwrap_wrapped(text: &str, width: usize) -> String {
+    if width == 0 || !text.contains('\n') {
+        return text.to_string();
+    }
+    let mut out: Vec<String> = Vec::new();
+    // The *unjoined* length of the row now sitting at the end of `out`: a
+    // chain of joins makes the accumulated string longer than the pane, and
+    // the edge test has to keep asking about the row as it was emitted.
+    let mut prev_len = 0usize;
+    for line in text.split('\n') {
+        let joins = out
+            .last()
+            .is_some_and(|prev| wraps_onto(prev, prev_len, line, width));
+        match joins {
+            true => {
+                let tail = strip_continuation(line);
+                prev_len = line.chars().count();
+                out.last_mut().expect("checked by is_some_and").push_str(tail);
+            },
+            false => {
+                prev_len = line.chars().count();
+                out.push(line.to_string());
+            },
+        }
+    }
+    out.join("\n")
+}
+
+/// Who answers a cmd+c: tmux, or the local terminal widget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopySource {
+    /// muxterm is holding a tmux-side selection; tmux copies it.
+    Tmux,
+    /// A local-only selection (shift+drag); the widget copies it.
+    Widget,
+    /// Neither is known - probe tmux for a selection the user made
+    /// themselves (a wheel-scrolled copy-mode).
+    AskTmux,
+}
+
+/// A pane muxterm parked in copy-mode wins over the local selection a drag
+/// leaves behind, and that precedence is load-bearing rather than a tidiness
+/// preference.
+///
+/// tmux is the only side that knows which display rows were one soft-wrapped
+/// logical line. Its copy-mode redraw positions the cursor per row (a bare
+/// `CUP` to the next line) instead of letting the client wrap, so the local
+/// grid holds two unrelated lines with no wrap flag between them - and a
+/// local copy of a wrapped path breaks it with a newline, plus the row's
+/// padding as trailing spaces. tmux's own copy joins them. So whenever tmux
+/// has the selection, tmux copies it.
+fn copy_source(copy_sel: bool, local_selection: bool) -> CopySource {
+    match (copy_sel, local_selection) {
+        (true, _) => CopySource::Tmux,
+        (false, true) => CopySource::Widget,
+        (false, false) => CopySource::AskTmux,
+    }
+}
+
 /// Index one past the last tab the sidebar's workspace list shows, given
 /// which tabs it shows at all - where a row dropped below every other row
 /// belongs.
@@ -6140,6 +6306,115 @@ mod tests {
         // `move_tab` can recognise a no-op and skip the write.
         assert_eq!(move_target(2, 2), 2);
         assert_eq!(move_target(2, 3), 2);
+    }
+
+    /// The reported bug, end to end: Claude Code breaks a long path to fit
+    /// its box and indents the continuation by two, so copying it used to
+    /// yield a path with a newline through the middle of a UUID.
+    #[test]
+    fn a_path_an_app_wrapped_comes_back_whole() {
+        let w = 112;
+        let head = "! python3 /private/tmp/claude-501/-Users-herval--muxterm-worktrees-humble-hound-iac/c118c02e-835f-4364-90ef-fa";
+        assert_eq!(head.chars().count(), 110, "fixture must reach the edge");
+        let copied = format!("{head}\n  47183b98d7/scratchpad/hex_pat_probe.py");
+        let joined = unwrap_wrapped(&copied, w);
+        assert!(
+            joined.contains("c118c02e-835f-4364-90ef-fa47183b98d7"),
+            "the UUID should be whole again: {joined:?}",
+        );
+        assert!(!joined.contains('\n'), "and it should be one line");
+    }
+
+    /// The joins it must refuse. Each of these would silently corrupt a
+    /// clipboard, which is the whole risk of guessing at invisible wraps.
+    #[test]
+    fn unwrap_leaves_text_that_only_looks_wrapped_alone() {
+        let w = 40;
+        // Indented, but the line above stopped nowhere near the edge - this
+        // is code, and joining it would destroy the program.
+        let code = "fn foo() {\n    let x = 1;\n}";
+        assert_eq!(unwrap_wrapped(code, w), code);
+
+        // Full-width rows, but the continuation is flush left: a column of
+        // paths (ls, find), where each row is its own item. This is the rule
+        // the link joiner rests on, and it is doing the work here.
+        let column = format!("{}\n{}", "a".repeat(40), "b".repeat(20));
+        assert_eq!(unwrap_wrapped(&column, w), column);
+
+        // Reached the edge but ends in a space: the emitter had room for
+        // more and chose to break, so the break is real.
+        let spaced = format!("{} \n  tail", "a".repeat(39));
+        assert_eq!(unwrap_wrapped(&spaced, w), spaced);
+
+        // A blank continuation is a paragraph break, not a wrap.
+        let para = format!("{}\n   ", "a".repeat(40));
+        assert_eq!(unwrap_wrapped(&para, w), para);
+
+        // Single line, and the width-unknown case, are pass-throughs.
+        assert_eq!(unwrap_wrapped("just one line", w), "just one line");
+        assert_eq!(unwrap_wrapped(code, 0), code);
+    }
+
+    /// Chained wraps join all the way through, and the edge test keeps
+    /// asking about each row as it was emitted - not about the ever-longer
+    /// string they are being joined into.
+    #[test]
+    fn unwrap_follows_a_wrap_across_several_rows() {
+        let w = 30;
+        let text = format!(
+            "{}\n  {}\n  {}\nnext item",
+            "a".repeat(30),
+            "b".repeat(28),
+            "c".repeat(4),
+        );
+        let joined = unwrap_wrapped(&text, w);
+        let mut lines = joined.split('\n');
+        assert_eq!(
+            lines.next().unwrap(),
+            format!("{}{}{}", "a".repeat(30), "b".repeat(28), "c".repeat(4)),
+        );
+        // The short final row did not reach the edge, so the flush-left line
+        // after it stays its own line.
+        assert_eq!(lines.next().unwrap(), "next item");
+        assert!(lines.next().is_none());
+    }
+
+    /// An agent CLI's gutter glyph is chrome: dropped, not joined in - the
+    /// same call egui_term's link joiner makes (P27).
+    #[test]
+    fn unwrap_drops_the_gutter_a_boxed_tui_prefixes() {
+        let w = 30;
+        for gutter in ["| ", "⎿ ", "│ ", "└ "] {
+            let text = format!("{}\n  {gutter}tail.py", "/some/long/path".repeat(2));
+            let joined = unwrap_wrapped(&text, w);
+            assert!(
+                joined.ends_with("tail.py") && !joined.contains('\n'),
+                "gutter {gutter:?} should be dropped: {joined:?}",
+            );
+            assert!(
+                !joined.contains(gutter.trim()),
+                "the glyph must not survive into the text: {joined:?}",
+            );
+        }
+    }
+
+    /// A plain drag leaves a selection on *both* sides - tmux's (it parked
+    /// the pane in copy-mode) and the widget's (it drew the drag locally) -
+    /// and tmux has to win. Its copy-mode redraw moves the cursor to each
+    /// row rather than letting the client wrap, so the local grid has no
+    /// wrap flags and copying from it breaks every soft-wrapped line with a
+    /// newline. Checking the local selection first, as this used to, is
+    /// exactly how a copied path came back with its UUID split in half.
+    #[test]
+    fn tmux_owns_the_copy_whenever_it_holds_the_selection() {
+        // The regression: both selections exist, and tmux must still copy.
+        assert_eq!(copy_source(true, true), CopySource::Tmux);
+        assert_eq!(copy_source(true, false), CopySource::Tmux);
+        // shift+drag: local only, tmux has nothing to give.
+        assert_eq!(copy_source(false, true), CopySource::Widget);
+        // Neither known: the user may have wheel-scrolled into copy-mode
+        // and selected there, so it is worth asking tmux.
+        assert_eq!(copy_source(false, false), CopySource::AskTmux);
     }
 
     /// Dropping a row below every other row lands it after the last row the
