@@ -68,7 +68,7 @@ pub struct Workspace {
     pub automation: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Worktree {
     pub path: PathBuf,
     pub branch: String,
@@ -604,10 +604,11 @@ pub struct Branch {
     pub name: String,
     /// Some("origin") when the branch exists only on that remote.
     pub remote: Option<String>,
-    /// A local branch already checked out somewhere (the main repo checkout
-    /// counts, so does any worktree); git refuses a second checkout, so the
-    /// popup dims it.
-    pub in_use: bool,
+    /// Where a local branch is already checked out (the main repo checkout
+    /// counts, so does any worktree). Git refuses a second checkout, so the
+    /// popup offers this folder instead and the App opens the tab in it
+    /// (`landing`).
+    pub worktree: Option<PathBuf>,
 }
 
 /// Every branch of `root`'s repo, local and remote, newest commit first.
@@ -657,7 +658,8 @@ pub fn parse_branches(out: &str) -> Vec<Branch> {
             branches.push(Branch {
                 name: name.to_string(),
                 remote: None,
-                in_use: !worktreepath.is_empty(),
+                worktree: (!worktreepath.is_empty())
+                    .then(|| PathBuf::from(worktreepath)),
             });
         } else if let Some(rest) = refname.strip_prefix("refs/remotes/") {
             let Some((remote, name)) = rest.split_once('/') else {
@@ -674,7 +676,7 @@ pub fn parse_branches(out: &str) -> Vec<Branch> {
             branches.push(Branch {
                 name: name.to_string(),
                 remote: Some(remote.to_string()),
-                in_use: false,
+                worktree: None,
             });
         }
     }
@@ -715,7 +717,7 @@ pub fn parse_ls_remote(out: &str) -> Vec<Branch> {
         .map(|name| Branch {
             name: name.to_string(),
             remote: Some("origin".to_string()),
-            in_use: false,
+            worktree: None,
         })
         .collect()
 }
@@ -784,10 +786,10 @@ pub enum BranchChoice {
 
 /// Classify the branch field's text. Exact-match only - a substring that
 /// matches nothing exactly is a `New` branch request (the popup's caption
-/// row spells out which of these will happen before submit). An in-use
-/// local branch still resolves `Existing`: git refuses the checkout and the
-/// App's failed-worktree fallback handles it, rather than silently doing
-/// something else with the name the user typed.
+/// row spells out which of these will happen before submit). A local branch
+/// already checked out somewhere still resolves `Existing`: the name the
+/// user typed is never repurposed; the App asks git where that checkout is
+/// at submit and opens the tab there instead (`landing`).
 pub fn resolve_branch(input: &str, branches: &[Branch]) -> BranchChoice {
     let text = input.trim();
     if text.is_empty() {
@@ -1116,11 +1118,24 @@ pub fn spawn_pr_head(
     });
 }
 
+/// A branch's existing checkout, from `git worktree list --porcelain`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Checkout {
+    /// The working directory holding the branch: the main checkout or a
+    /// linked worktree, wherever it lives.
+    pub path: PathBuf,
+    /// The directory is gone but git still has the entry - and still counts
+    /// the branch as checked out until `prune_worktrees`.
+    pub prunable: bool,
+}
+
 /// The worktree already holding `branch`, if any. `git worktree add` refuses
-/// a branch that is checked out somewhere else, which is the normal case for
-/// a PR muxterm itself opened: the workspace that raised it still has the
-/// branch. Knowing this up front turns a hard failure into "go to it".
-pub fn worktree_for_branch(root: &Path, branch: &str) -> Option<PathBuf> {
+/// a branch that is checked out somewhere else - the normal case for a PR
+/// muxterm itself opened (the workspace that raised it still has the
+/// branch), and for a cmd+n on `main` or on a branch an archived workspace
+/// holds. Knowing this up front turns a hard failure into "open it there"
+/// (`landing`).
+pub fn worktree_for_branch(root: &Path, branch: &str) -> Option<Checkout> {
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -1130,19 +1145,113 @@ pub fn worktree_for_branch(root: &Path, branch: &str) -> Option<PathBuf> {
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut path: Option<PathBuf> = None;
-    for line in text.lines() {
-        if let Some(p) = line.strip_prefix("worktree ") {
-            path = Some(PathBuf::from(p.trim()));
-        } else if let Some(b) = line.strip_prefix("branch ") {
-            let name = b.trim().strip_prefix("refs/heads/").unwrap_or(b.trim());
-            if name == branch {
-                return path;
+    parse_worktree_list(&String::from_utf8_lossy(&out.stdout), branch)
+}
+
+/// Pure half of `worktree_for_branch`. The porcelain is blank-line-separated
+/// blocks: `worktree <path>`, then attribute lines (`HEAD`, `branch
+/// refs/heads/x` or `detached`, `locked`, `prunable <why>`). Fixture-tested.
+pub fn parse_worktree_list(text: &str, branch: &str) -> Option<Checkout> {
+    for block in text.split("\n\n") {
+        let mut path: Option<PathBuf> = None;
+        let mut prunable = false;
+        let mut matched = false;
+        for line in block.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(p.trim()));
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                let b = b.trim();
+                matched = b.strip_prefix("refs/heads/").unwrap_or(b) == branch;
+            } else if line.starts_with("prunable") {
+                prunable = true;
             }
+        }
+        if matched {
+            return path.map(|path| Checkout { path, prunable });
         }
     }
     None
+}
+
+/// Drop git's bookkeeping for worktrees whose directory is gone (`git
+/// worktree prune`; local, idempotent). A vanished worktree still pins its
+/// branch (`worktree add` reads the stale entry's HEAD) and its path still
+/// reads as assigned, so a fresh claim on that branch - which picks the same
+/// directory name - would be refused twice over without this.
+pub fn prune_worktrees(root: &Path) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "prune"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {},
+        Ok(o) => log::warn!(
+            "worktree prune failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => log::warn!(
+            "worktree prune failed to run in {}: {e}",
+            root.display()
+        ),
+    }
+}
+
+/// Where a workspace on a branch opens, given the branch's existing checkout
+/// (`worktree_for_branch`) and the toplevel of the folder the user picked
+/// (`repo_toplevel`). Shared by cmd+n and the PR row's check-out.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Landing {
+    /// Nothing holds the branch (or only a pruned entry does): claim and
+    /// check out a fresh worktree as usual.
+    Claim,
+    /// The branch is checked out in the very tree the user picked the
+    /// folder from - possibly a subfolder of it. Open a plain workspace in
+    /// their folder: that checkout is theirs, never this tab's worktree
+    /// (which close/delete would otherwise try to remove).
+    Root,
+    /// The branch is checked out elsewhere: open the tab in that worktree
+    /// and record it, so the sidebar names the branch.
+    Reuse(Worktree),
+}
+
+pub fn landing(
+    branch: &str,
+    checkout: Option<&Checkout>,
+    toplevel: Option<&Path>,
+) -> Landing {
+    let Some(c) = checkout.filter(|c| !c.prunable) else {
+        return Landing::Claim;
+    };
+    if toplevel.is_some_and(|t| same_dir(t, &c.path)) {
+        return Landing::Root;
+    }
+    Landing::Reuse(Worktree {
+        path: c.path.clone(),
+        branch: branch.to_string(),
+    })
+}
+
+/// Resolve symlinks so two spellings of one directory compare equal (`/tmp`
+/// vs `/private/tmp`, a symlinked `~/.muxterm`); a vanished path keeps its
+/// spelling.
+fn canon(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    canon(a) == canon(b)
+}
+
+/// Is `path` a worktree muxterm made - one strictly under `worktrees_dir`
+/// (`~/.muxterm/worktrees/`, where every claim lands)? Only those are ever
+/// `git worktree remove`d on close/delete: a tab may sit in a checkout
+/// muxterm didn't create (a hand-made worktree, `Landing::Reuse`), and
+/// removing that would be discarding someone else's directory. Pure.
+pub fn managed_worktree(path: &Path, worktrees_dir: &Path) -> bool {
+    let (p, d) = (canon(path), canon(worktrees_dir));
+    p != d && p.starts_with(&d)
 }
 
 /// Where a GitHub repo's clone would live if muxterm made it.
@@ -1736,22 +1845,26 @@ mod tests {
         assert_eq!(Workspace::from_state(st).agent, None);
     }
 
-    fn local(name: &str, in_use: bool) -> Branch {
-        Branch { name: name.into(), remote: None, in_use }
+    fn local(name: &str, worktree: Option<&str>) -> Branch {
+        Branch {
+            name: name.into(),
+            remote: None,
+            worktree: worktree.map(PathBuf::from),
+        }
     }
 
     fn remote(name: &str, remote: &str) -> Branch {
         Branch {
             name: name.into(),
             remote: Some(remote.into()),
-            in_use: false,
+            worktree: None,
         }
     }
 
     #[test]
     fn parse_branches_fixture() {
         // Newest-first input order is preserved; worktreepath (main repo or
-        // a linked worktree) marks in_use; origin/HEAD is dropped; remote
+        // a linked worktree) rides along; origin/HEAD is dropped; remote
         // prefixes strip even on slashed branch names; a local name shadows
         // its remote; remote-vs-remote dedupe keeps the earlier (newer) line.
         let out = "\
@@ -1768,11 +1881,11 @@ refs/heads/quiet\t
         assert_eq!(
             bs,
             vec![
-                local("feat/x", true),
-                local("main", true),
+                local("feat/x", Some("/Users/u/.muxterm/worktrees/feat-x")),
+                local("main", Some("/Users/u/dev/proj")),
                 remote("review/deep/name", "origin"),
                 remote("shared", "upstream"),
-                local("quiet", false),
+                local("quiet", None),
             ]
         );
         assert!(parse_branches("").is_empty());
@@ -1781,8 +1894,8 @@ refs/heads/quiet\t
     #[test]
     fn resolve_branch_classifies() {
         let bs = vec![
-            local("main", true),
-            local("feature", false),
+            local("main", Some("/repo")),
+            local("feature", None),
             remote("review/x", "origin"),
         ];
         assert_eq!(resolve_branch("  ", &bs), BranchChoice::Codename);
@@ -1790,8 +1903,8 @@ refs/heads/quiet\t
             resolve_branch("feature", &bs),
             BranchChoice::Existing("feature".into())
         );
-        // In-use locals still resolve Existing: git refuses the checkout and
-        // the App's fallback handles it - the name is never repurposed.
+        // Checked-out locals still resolve Existing - the name is never
+        // repurposed; the App opens the tab in that checkout (`landing`).
         assert_eq!(
             resolve_branch("main", &bs),
             BranchChoice::Existing("main".into())
@@ -1808,6 +1921,96 @@ refs/heads/quiet\t
             resolve_branch("feat", &bs),
             BranchChoice::New("feat".into())
         );
+    }
+
+    #[test]
+    fn parse_worktree_list_finds_checkouts() {
+        // Main checkout first, a linked worktree, a pruned one whose dir is
+        // gone, and a detached entry with no branch line at all.
+        let out = "\
+worktree /Users/u/dev/proj
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/main
+
+worktree /Users/u/.muxterm/worktrees/feat-x
+HEAD 2222222222222222222222222222222222222222
+branch refs/heads/feat/x
+
+worktree /Users/u/.muxterm/worktrees/gone
+HEAD 3333333333333333333333333333333333333333
+branch refs/heads/gone
+prunable gitdir file points to non-existent location
+
+worktree /Users/u/dev/detached
+HEAD 4444444444444444444444444444444444444444
+detached
+";
+        let at = |p: &str, prunable: bool| {
+            Some(Checkout { path: PathBuf::from(p), prunable })
+        };
+        assert_eq!(
+            parse_worktree_list(out, "main"),
+            at("/Users/u/dev/proj", false)
+        );
+        assert_eq!(
+            parse_worktree_list(out, "feat/x"),
+            at("/Users/u/.muxterm/worktrees/feat-x", false)
+        );
+        assert_eq!(
+            parse_worktree_list(out, "gone"),
+            at("/Users/u/.muxterm/worktrees/gone", true)
+        );
+        assert_eq!(parse_worktree_list(out, "nope"), None);
+        assert_eq!(parse_worktree_list("", "main"), None);
+    }
+
+    #[test]
+    fn landing_picks_claim_root_or_reuse() {
+        let scratch = std::env::temp_dir()
+            .join(format!("muxterm-landing-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&scratch).unwrap();
+        let at = |p: &Path, prunable: bool| Checkout {
+            path: p.to_path_buf(),
+            prunable,
+        };
+        // Nothing holds the branch: claim a fresh worktree.
+        assert_eq!(landing("b", None, Some(&scratch)), Landing::Claim);
+        // A pruned entry is no checkout.
+        let gone = at(&scratch.join("gone"), true);
+        assert_eq!(landing("b", Some(&gone), Some(&scratch)), Landing::Claim);
+        // Checked out in the user's own tree - even spelled differently
+        // (temp_dir is a symlink on macOS): a plain workspace there.
+        let own = at(&scratch.canonicalize().unwrap(), false);
+        assert_eq!(landing("b", Some(&own), Some(&scratch)), Landing::Root);
+        // Checked out elsewhere: open that worktree.
+        let other = scratch.join("other");
+        let reuse = Landing::Reuse(Worktree {
+            path: other.clone(),
+            branch: "b".into(),
+        });
+        assert_eq!(landing("b", Some(&at(&other, false)), Some(&scratch)), reuse);
+        // No toplevel to compare against still reuses rather than guessing.
+        assert_eq!(landing("b", Some(&at(&other, false)), None), reuse);
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn managed_worktree_is_strictly_under_the_dir() {
+        let scratch = std::env::temp_dir()
+            .join(format!("muxterm-managed-{}", uuid::Uuid::new_v4()));
+        let dir = scratch.join("worktrees");
+        fs::create_dir_all(dir.join("feat-x")).unwrap();
+        fs::create_dir_all(scratch.join("elsewhere")).unwrap();
+        assert!(managed_worktree(&dir.join("feat-x"), &dir));
+        assert!(!managed_worktree(&scratch.join("elsewhere"), &dir));
+        assert!(!managed_worktree(&dir, &dir), "the dir itself is no worktree");
+        // Through a symlinked parent, either way round (git prints
+        // realpaths; ~/.muxterm may be a link).
+        let link = scratch.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(managed_worktree(&link.join("feat-x"), &dir));
+        assert!(managed_worktree(&dir.join("feat-x"), &link));
+        fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
@@ -1834,7 +2037,7 @@ ffeedd refs/heads/
             "heads only, empty names dropped"
         );
         assert!(bs.iter().all(|b| b.remote.as_deref() == Some("origin")));
-        assert!(bs.iter().all(|b| !b.in_use));
+        assert!(bs.iter().all(|b| b.worktree.is_none()));
         assert!(parse_ls_remote("").is_empty());
     }
 
@@ -2107,7 +2310,7 @@ ffeedd refs/heads/
         assert!(names.contains(&"feat/x"));
         assert!(names.contains(&"remote-only"));
         let main = listed.iter().find(|b| b.name == "main").unwrap();
-        assert!(main.in_use, "the main checkout counts as in use");
+        assert!(main.worktree.is_some(), "the main checkout counts as in use");
         let ro = listed.iter().find(|b| b.name == "remote-only").unwrap();
         assert_eq!(ro.remote.as_deref(), Some("origin"));
 
@@ -2122,6 +2325,19 @@ ffeedd refs/heads/
         populate_worktree(&repo, &wt, &BranchChoice::Existing("feat/x".into()))
             .unwrap();
         assert_eq!(git(&wt.path, &["rev-parse", "--abbrev-ref", "HEAD"]), "feat/x");
+
+        // worktree_for_branch finds the main checkout and the linked
+        // worktree alike (compare canonicalized: /tmp is /private/tmp).
+        let found = |name: &str| {
+            worktree_for_branch(&repo, name)
+                .map(|c| (c.path.canonicalize().unwrap(), c.prunable))
+        };
+        assert_eq!(found("main"), Some((repo.canonicalize().unwrap(), false)));
+        assert_eq!(
+            found("feat/x"),
+            Some((wt.path.canonicalize().unwrap(), false))
+        );
+        assert_eq!(found("nope"), None);
 
         // Track: creates a local branch tracking the fabricated remote ref.
         let wt = Worktree { path: claim("wt-track"), branch: "remote-only".into() };
@@ -2158,6 +2374,26 @@ ffeedd refs/heads/
             &BranchChoice::Existing("main".into()),
         );
         assert!(err.is_err(), "second checkout of main must fail");
+
+        // A worktree whose directory vanished behind git's back still pins
+        // its branch: listed as prunable, and `worktree add` keeps refusing
+        // until the entry is pruned.
+        git(&repo, &["branch", "feat/y"]);
+        let dead = scratch.join("wt-dead");
+        git(&repo, &["worktree", "add", dead.to_str().unwrap(), "feat/y"]);
+        fs::remove_dir_all(&dead).unwrap();
+        let stale = worktree_for_branch(&repo, "feat/y").expect("stale entry");
+        assert!(stale.prunable);
+        let wt = Worktree { path: claim("wt-revived"), branch: "feat/y".into() };
+        let choice = BranchChoice::Existing("feat/y".into());
+        assert!(
+            populate_worktree(&repo, &wt, &choice).is_err(),
+            "a pruned-but-listed checkout still pins the branch"
+        );
+        prune_worktrees(&repo);
+        assert_eq!(worktree_for_branch(&repo, "feat/y"), None);
+        populate_worktree(&repo, &wt, &choice).unwrap();
+        assert_eq!(git(&wt.path, &["rev-parse", "--abbrev-ref", "HEAD"]), "feat/y");
 
         fs::remove_dir_all(&scratch).unwrap();
     }

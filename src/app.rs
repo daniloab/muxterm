@@ -40,7 +40,7 @@ use muxterm::state::{self, LoadResult, NodeState, StateFile, TabState, WindowSta
 use crate::tabbar::{self, TabBarAction};
 use crate::theme::{self, UiTheme};
 use crate::tmux::{self, TmuxCtl};
-use crate::workspace::{self, Workspace};
+use crate::workspace::{self, BranchChoice, Landing, Workspace};
 use crate::workspace_popup::{self, NewWorkspaceForm};
 
 const PANE_GAP: f32 = 4.0;
@@ -932,15 +932,10 @@ impl App {
             self.refuse_delete(i, "worktree checkout still in flight");
             return;
         }
-        // The dirty gate: only an existing worktree can hold unsaved work
-        // (a vanished dir has nothing to lose and nothing to remove).
-        let wt_live = tab
-            .workspace
-            .worktree
-            .as_ref()
-            .is_some_and(|w| w.path.exists());
-        if wt_live {
-            let path = tab.workspace.worktree.as_ref().unwrap().path.clone();
+        // The dirty gate: only a worktree this delete would actually remove
+        // can lose unsaved work (a vanished, shared or hand-made one stays
+        // on disk whatever its state).
+        if let Some(path) = self.removable_worktree(tab) {
             if let Some(reason) = workspace::worktree_delete_refusal(&path) {
                 self.refuse_delete(i, &reason);
                 return;
@@ -950,15 +945,50 @@ impl App {
         self.remove_tab_and_worktree(ctx, i);
     }
 
+    /// The worktree a tab's teardown may `git worktree remove`, if any: it
+    /// exists, its checkout isn't still in flight, muxterm made it
+    /// (`workspace::managed_worktree` - a tab can sit in a hand-made
+    /// checkout, `Landing::Reuse`), and no other tab - archived included -
+    /// sits in the same directory (cmd+n on a branch an archived workspace
+    /// holds opens a second tab in that worktree). Every teardown decision
+    /// - the close-time keep/delete modal, the archived row's dirty refusal,
+    /// both removals - goes through this one predicate so they can't
+    /// disagree: a worktree that would never be removed is never worth a
+    /// question either. The tab itself is skipped by id, since it is still
+    /// in `self.tabs` at the gates and already out at the removals.
+    fn removable_worktree(&self, tab: &Tab) -> Option<PathBuf> {
+        let w = tab.workspace.worktree.as_ref()?;
+        if !w.path.exists() || self.pending_worktrees.contains(&tab.tab_id) {
+            return None;
+        }
+        if !workspace::managed_worktree(&w.path, &state::worktrees_dir()) {
+            return None;
+        }
+        let here = canon(&w.path);
+        let shared = self
+            .tabs
+            .iter()
+            .filter(|t| t.tab_id != tab.tab_id)
+            .any(|t| {
+                t.workspace
+                    .worktree
+                    .as_ref()
+                    .is_some_and(|o| canon(&o.path) == here)
+            });
+        (!shared).then(|| w.path.clone())
+    }
+
     /// Tear a tab down and, if it has a live worktree, remove it off-thread.
     /// Kills every pane's session first (a live shell cwd'd inside the
     /// vanishing dir showers getcwd errors - the failed-checkout doctrine in
     /// workspace.rs), drops the tab and its per-tab-id state, repoints `active`
     /// to a visible neighbour (opening a bare tab if the pile is now all
     /// archived - the app never quits here), and force-removes the worktree
-    /// (branch preserved). The guards - archived? dirty? in flight? - are the
-    /// *caller's*; by here the decision to destroy is final. Shared by the
-    /// archived-row delete and the close-confirm's Delete.
+    /// (branch preserved) when it is muxterm's to remove (`removable_worktree`
+    /// - a shared or hand-made one stays). The guards - archived? dirty? in
+    /// flight? - are the *caller's*; by here the decision to destroy is
+    /// final. Shared by the archived-row delete and the close-confirm's
+    /// Delete.
     fn remove_tab_and_worktree(&mut self, ctx: &egui::Context, i: usize) {
         // Landing spot before the removal shifts indices; `nearest_visible`
         // works on pre-removal indices and the result maps through the shift.
@@ -988,14 +1018,18 @@ impl App {
                 active_after_removal(self.active, i, self.tabs.len());
         }
         self.dirty = true;
-        let wt_live = tab
-            .workspace
-            .worktree
-            .as_ref()
-            .is_some_and(|w| w.path.exists());
-        if wt_live {
-            let w = tab.workspace.worktree.expect("wt_live checked");
-            workspace::spawn_worktree_removal(w.path, tab.workspace.root);
+        match self.removable_worktree(&tab) {
+            Some(path) => {
+                workspace::spawn_worktree_removal(path, tab.workspace.root)
+            },
+            None => {
+                if let Some(w) = &tab.workspace.worktree {
+                    log::info!(
+                        "delete: leaving worktree {} in place (shared, or not muxterm's)",
+                        w.path.display()
+                    );
+                }
+            },
         }
     }
 
@@ -1050,7 +1084,28 @@ impl App {
             || (form.create_worktree
                 && root.as_deref().is_some_and(workspace::is_git_repo));
         let branch_choice = form.branch_choice();
-        let claim = want_worktree
+        // A branch already checked out - in the picked tree itself or in any
+        // worktree - can't be checked out again (git refuses), so the tab
+        // opens in that folder instead, exactly as the PR row's check-out
+        // does. Asked of git at submit, not read off the popup's list (a
+        // snapshot from when it opened). A pruned entry is cleared first: it
+        // would still pin the branch and its old directory name.
+        let landing = match (&branch_choice, want_worktree, &clone) {
+            (BranchChoice::Existing(name), true, None) => {
+                let repo = root.as_deref().expect("want_worktree implies a root");
+                let found = workspace::worktree_for_branch(repo, name);
+                if found.as_ref().is_some_and(|c| c.prunable) {
+                    workspace::prune_worktrees(repo);
+                }
+                workspace::landing(
+                    name,
+                    found.as_ref(),
+                    workspace::repo_toplevel(repo).as_deref(),
+                )
+            },
+            _ => Landing::Claim,
+        };
+        let claim = (want_worktree && landing == Landing::Claim)
             .then(|| {
                 let repo = root.as_deref().expect("want_worktree implies a root");
                 workspace::claim_worktree(repo, &branch_choice)
@@ -1065,8 +1120,16 @@ impl App {
             log::error!("no worktree claim for a clone; not opening the tab");
             return;
         }
-        let start_dir = claim
+        // An existing checkout elsewhere is this tab's worktree from the
+        // start; the user's own tree (Landing::Root) is a plain workspace in
+        // the folder they picked, never a worktree of its own repo.
+        let reused = match landing {
+            Landing::Reuse(wt) => Some(wt),
+            Landing::Claim | Landing::Root => None,
+        };
+        let start_dir = reused
             .as_ref()
+            .or(claim.as_ref())
             .map(|w| w.path.clone())
             .or_else(|| root.clone())
             .map(|p| p.display().to_string());
@@ -1155,7 +1218,9 @@ impl App {
             root: root.clone(),
             description: None,
             prompt: prompt.clone(),
-            worktree: None, // filled in when the async checkout finishes
+            // A claim's is filled in when the async checkout finishes; a
+            // reused one is known now (launch_agent's subdir cd reads it).
+            worktree: reused,
             agent: agent.map(|a| a.id),
             model: model.clone(),
             created_at: mesh::now(),
@@ -1233,9 +1298,12 @@ impl App {
                 ctx.clone(),
             );
         } else {
-            // No worktree: run the agent straight away in the root (its cd
-            // into a subfolder project's subdir rides launch_agent), then
-            // boot the template's side panes in the same place.
+            // Nothing to check out - a plain root workspace, or a checkout
+            // that already exists (Landing::Root/Reuse: the panes spawned in
+            // it, and no fetch either - git refuses to move a checked-out
+            // branch). Run the agent straight away (its cd into a subfolder
+            // project's subdir rides launch_agent), then boot the template's
+            // side panes in the same place.
             self.launch_agent(&tab_id, None, None);
             self.launch_template_panes(&tab_id, None, false);
         }
@@ -2530,25 +2598,23 @@ impl App {
         // of tearing the tab down: Archive keeps the workspace (worktree and
         // sessions intact), Delete closes it and removes the worktree. Only
         // kill=true - a reactive close means the shell already exited, so
-        // there's no live workspace to archive (reclaim_worktree covers that).
+        // there's no live workspace to archive (reclaim_worktree covers that)
+        // - and only a worktree Delete would actually remove
+        // (`removable_worktree`): a shared or hand-made one stays either way,
+        // so the question would be moot.
         if kill {
             if let Some(tab) = self.tabs.get(tab_idx) {
                 let empties = tab.panes.len() == 1
                     && tab.panes.contains_key(&pane_id);
-                if empties && !self.pending_worktrees.contains(&tab.tab_id) {
-                    if let Some(w) = tab
-                        .workspace
-                        .worktree
-                        .as_ref()
-                        .filter(|w| w.path.exists())
-                    {
+                if empties {
+                    if let Some(path) = self.removable_worktree(tab) {
                         if let Some(reason) =
-                            workspace::worktree_delete_refusal(&w.path)
+                            workspace::worktree_delete_refusal(&path)
                         {
                             self.confirm_worktree.push(WorktreeConfirm {
                                 tab_id: tab.tab_id.clone(),
                                 title: tab.workspace.title.clone(),
-                                path: w.path.clone(),
+                                path,
                                 reason,
                             });
                             return;
@@ -2615,19 +2681,18 @@ impl App {
         let Some(w) = tab.workspace.worktree.as_ref() else {
             return;
         };
-        if !w.path.exists() {
+        let Some(path) = self.removable_worktree(tab) else {
+            if w.path.exists() {
+                log::info!(
+                    "close: leaving worktree {} in place (in flight, shared, or not muxterm's)",
+                    w.path.display()
+                );
+            }
             return;
-        }
-        if self.pending_worktrees.contains(&tab.tab_id) {
-            log::debug!(
-                "close: worktree checkout in flight for {}; leaving it",
-                w.path.display()
-            );
-            return;
-        }
-        match workspace::worktree_delete_refusal(&w.path) {
+        };
+        match workspace::worktree_delete_refusal(&path) {
             None => workspace::spawn_worktree_removal(
-                w.path.clone(),
+                path,
                 tab.workspace.root.clone(),
             ),
             Some(reason) => log::info!(
@@ -3994,29 +4059,36 @@ impl App {
         }
         let root = self.pr_repo_root(&item.repo);
         // The branch is checked out somewhere muxterm has no tab for (a
-        // workspace that was deleted, or a worktree made by hand). Open that
-        // directory rather than failing on `git worktree add`.
-        let existing = workspace::worktree_for_branch(&root, &branch);
+        // workspace that was deleted, a worktree made by hand, the repo's
+        // own checkout). Open that directory rather than failing on `git
+        // worktree add` - the same `landing` cmd+n uses; a pruned entry is
+        // cleared so a fresh claim can land.
+        let found = workspace::worktree_for_branch(&root, &branch);
+        if found.as_ref().is_some_and(|c| c.prunable) {
+            workspace::prune_worktrees(&root);
+        }
+        let landing = workspace::landing(
+            &branch,
+            found.as_ref(),
+            workspace::repo_toplevel(&root).as_deref(),
+        );
         let key = (item.repo.clone(), item.number);
         if !self.pr_opening.insert(key.clone()) {
             return;
         }
-        let claim = match &existing {
-            Some(path) => workspace::Worktree {
-                path: path.clone(),
-                branch: branch.clone(),
-            },
-            None => {
+        // Where the pane opens, what the tab records, and whether a checkout
+        // still has to land (the claim).
+        let (start_dir, worktree, claim) = match landing {
+            Landing::Root => (root.clone(), None, None),
+            Landing::Reuse(wt) => (wt.path.clone(), Some(wt), None),
+            Landing::Claim => {
                 // The worktree directory is named for the PR, not the branch:
                 // `pr-9645` reads better in a path than a codename.
                 match workspace::claim_worktree(
                     &root,
-                    &workspace::BranchChoice::New(format!(
-                        "pr-{}",
-                        item.number
-                    )),
+                    &BranchChoice::New(format!("pr-{}", item.number)),
                 ) {
-                    Ok(c) => c,
+                    Ok(c) => (c.path.clone(), None, Some(c)),
                     Err(e) => {
                         log::error!("no worktree claim for {}: {e:#}", item.repo);
                         self.pr_opening.remove(&key);
@@ -4025,7 +4097,7 @@ impl App {
                 }
             },
         };
-        let start_dir = claim.path.to_string_lossy().to_string();
+        let start_dir = start_dir.to_string_lossy().to_string();
         let pane = match self.create_pane(ctx, None, Some(start_dir)) {
             Ok(p) => p,
             Err(e) => {
@@ -4041,9 +4113,7 @@ impl App {
         workspace.agent = Some(self.agent.id);
         // No model override: the agent's own default, as a bare cmd+n would.
         workspace.pr = Some(key.clone());
-        if existing.is_some() {
-            workspace.worktree = Some(claim.clone());
-        }
+        workspace.worktree = worktree;
         let mut panes = HashMap::new();
         panes.insert(id, pane);
         self.tabs.push(Tab {
@@ -4057,14 +4127,14 @@ impl App {
         });
         self.active = self.tabs.len() - 1;
         self.dirty = true;
-        match existing {
-            // Nothing to check out - the worktree is already there, so the
+        match claim {
+            // Nothing to check out - the checkout is already there, so the
             // agent can start immediately.
-            Some(_) => {
+            None => {
                 self.pr_opening.remove(&key);
                 self.launch_agent(&tab_id, None, None);
             },
-            None => {
+            Some(claim) => {
                 self.pending_worktrees.insert(tab_id.clone());
                 self.worktree_progress
                     .insert(tab_id.clone(), "preparing worktree…".to_string());

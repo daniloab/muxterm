@@ -765,14 +765,14 @@ fn branch_picker(
     for i in 0..slots {
         match matches.get(i) {
             Some(b) => {
-                let note = match (&b.remote, b.in_use) {
+                let note = match (&b.remote, &b.worktree) {
                     (Some(remote), _) => format!("({remote})"),
-                    (None, true) => "(checked out)".to_string(),
-                    (None, false) => String::new(),
+                    (None, Some(_)) => "(checked out)".to_string(),
+                    (None, None) => String::new(),
                 };
                 let selected = form.branch.trim() == b.name;
                 if panel
-                    .option(ui, &b.name, &note, !b.in_use, selected)
+                    .option(ui, &b.name, &note, true, selected)
                     .clicked()
                 {
                     pick = Some(b.name.clone());
@@ -803,19 +803,23 @@ fn branch_picker(
             th.text_dim,
         ),
         BranchChoice::Existing(name) => {
-            let in_use = form
+            // A branch checked out somewhere can't be checked out again;
+            // Create opens the tab in that folder instead (the App's
+            // `landing`), so say where.
+            let checkout = form
                 .branches
                 .iter()
-                .any(|b| b.remote.is_none() && b.in_use && b.name == name);
-            if in_use {
-                // Pickable rows are already dimmed; this catches a typed-in
-                // name. Creation will fail into the walk-back-to-root path.
-                (
-                    format!("-> '{name}' is checked out elsewhere"),
-                    th.status_warn,
-                )
-            } else {
-                ("-> check out existing branch".to_string(), th.text_dim)
+                .find(|b| b.remote.is_none() && b.name == name)
+                .and_then(|b| b.worktree.as_deref());
+            match checkout {
+                Some(path) => (
+                    format!(
+                        "-> open its checkout at {}",
+                        home_abbrev(&path.display().to_string())
+                    ),
+                    th.text_dim,
+                ),
+                None => ("-> check out existing branch".to_string(), th.text_dim),
             }
         },
         BranchChoice::Track { name, remote } => {
@@ -1261,20 +1265,20 @@ mod tests {
         }
     }
 
-    fn branch(name: &str, remote: Option<&str>, in_use: bool) -> Branch {
+    fn branch(name: &str, remote: Option<&str>, worktree: Option<&str>) -> Branch {
         Branch {
             name: name.into(),
             remote: remote.map(str::to_string),
-            in_use,
+            worktree: worktree.map(PathBuf::from),
         }
     }
 
     #[test]
     fn filter_branches_substring_case_insensitive() {
         let bs = vec![
-            branch("Feature/Login", None, false),
-            branch("main", None, true),
-            branch("fix-log-rotation", Some("origin"), false),
+            branch("Feature/Login", None, None),
+            branch("main", None, Some("/srv/proj")),
+            branch("fix-log-rotation", Some("origin"), None),
         ];
         let names = |v: Vec<&Branch>| {
             v.iter().map(|b| b.name.clone()).collect::<Vec<_>>()
@@ -1307,9 +1311,9 @@ mod tests {
         form.is_repo = true;
         form.create_worktree = true;
         form.branches = vec![
-            branch("main", None, true),
-            branch("feat/api-gateway", None, false),
-            branch("review/x", Some("origin"), false),
+            branch("main", None, Some("/srv/proj")),
+            branch("feat/api-gateway", None, None),
+            branch("review/x", Some("origin"), None),
         ];
 
         let input = egui::RawInput {
@@ -1363,6 +1367,18 @@ mod tests {
             !joined.contains("feat/api-gateway"),
             "filtered-out branch still painted: {texts:?}"
         );
+
+        // A branch already checked out is offered, not refused: the caption
+        // names the folder the tab will open in.
+        form.branch = "main".into();
+        let texts = render(&mut form);
+        let joined = texts.join("\u{1}");
+        assert!(
+            joined.contains("-> open its checkout at /srv/proj"),
+            "caption for a checked-out branch: {texts:?}"
+        );
+        assert!(!joined.contains("checked out elsewhere"));
+        form.branch = "review/x".into();
 
         // cmd+Enter submits, and the form hands create_workspace the same
         // resolution the caption promised.
@@ -1568,8 +1584,8 @@ mod tests {
         form.remote_branches.insert(
             repo,
             Some(vec![
-                branch("main", Some("origin"), false),
-                branch("feat/api", Some("origin"), false),
+                branch("main", Some("origin"), None),
+                branch("feat/api", Some("origin"), None),
             ]),
         );
         let joined = render(&mut form);
