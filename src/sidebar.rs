@@ -613,7 +613,7 @@ fn pr_row(
     let icon_resp = (!pr.busy).then(|| {
         ui.interact(
             icon_rect,
-            ui.id().with(("pr_row_checkout", pr.number)),
+            ui.id().with(("pr_row_checkout", pr.repo.as_str(), pr.number)),
             egui::Sense::click(),
         )
         .on_hover_text("check out as a worktree")
@@ -626,7 +626,7 @@ fn pr_row(
     let hide_resp = (!pr.busy).then(|| {
         ui.interact(
             hide_rect,
-            ui.id().with(("pr_row_hide", pr.number)),
+            ui.id().with(("pr_row_hide", pr.repo.as_str(), pr.number)),
             egui::Sense::click(),
         )
         .on_hover_text("hide from this list")
@@ -1812,6 +1812,70 @@ mod tests {
             draft: false,
             busy,
         }
+    }
+
+    /// Two open PRs can share a number (one per repo). Their rows' icon
+    /// interacts must not share an egui id: with a clash egui keeps one rect
+    /// per id, so the other row's ✕/↓ has nothing to hit and its click
+    /// falls through to the body - the preview opens instead of the PR
+    /// being hidden. egui paints a "First/Second use of ... ID" warning on
+    /// a clash (debug builds), which is what this asserts against.
+    #[test]
+    fn same_numbered_prs_in_two_repos_keep_their_own_icons() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let prs = vec![
+            PrRow {
+                index: 0,
+                number: 10,
+                repo: "herval/clio-backend".into(),
+                title: "Wzap WIP".into(),
+                draft: false,
+                busy: false,
+            },
+            PrRow {
+                index: 1,
+                number: 10,
+                repo: "herval/tinyverse".into(),
+                title: "React experimental".into(),
+                draft: false,
+                busy: false,
+            },
+        ];
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let mut frame = |ctx: &egui::Context| {
+            let _ = show(ctx, &[], false, &prs, None, false, None, false, false, &font, &th);
+        };
+        let _ = ctx.run(input.clone(), &mut frame);
+        let output = ctx.run(input, &mut frame);
+        let mut shapes = Vec::new();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut shapes);
+        }
+        let texts: Vec<String> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !texts.iter().any(|t| t.contains(" use of ")),
+            "two #10 rows clashed on an egui id: {texts:?}",
+        );
+        assert_eq!(
+            texts.iter().filter(|t| t.starts_with("#10 ")).count(),
+            2,
+            "both rows painted: {texts:?}",
+        );
     }
 
     /// A row's PR chips paint `#N` for each live PR - and only for those,
