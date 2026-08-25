@@ -55,14 +55,22 @@ pub type Dismissed = Arc<Mutex<HashSet<(String, String)>>>;
 pub struct Badge {
     pub number: u64,
     pub url: String,
+    pub title: String,
     pub kind: Kind,
     /// Tooltip: "#12 title\nfeat-x · checks pending · approved".
     pub detail: String,
     /// The (root, branch) this badge is remembered under - the dismissal
-    /// key, and how the App tells a chip's branch from the pane's. No
-    /// Instants here: derived PartialEq drives the poller's send-on-change.
+    /// key. No Instants here: derived PartialEq drives the poller's
+    /// send-on-change.
     pub root: String,
     pub branch: String,
+    /// The session's checkout is on this badge's branch *right now* - not
+    /// merely a branch its root remembers. Set per session by `snapshot`
+    /// from the poller's own live (root, branch) scan, so it needs no join
+    /// against the separate `git_status` poller (a different toggle, a
+    /// different tick). It is what makes a PR "checked out": the sidebar's
+    /// chip test and the HUD's dismissability test.
+    pub live: bool,
 }
 
 /// Visual severity of the chip's icon; the words live in `detail`.
@@ -410,7 +418,7 @@ fn run(
             save_memory(&memory_path, &memory);
         }
 
-        let snapshot = snapshot(&roots, &cache);
+        let snapshot = snapshot(&roots, &keys, &cache);
         if last_sent.as_ref() != Some(&snapshot) {
             log::debug!("pr_status: {snapshot:?}");
             last_sent = Some(snapshot.clone());
@@ -456,20 +464,30 @@ fn fetch_target(entry: Option<&Entry>, live: bool) -> Option<u64> {
 }
 
 /// session -> every remembered badge under that session's root, PR number
-/// ascending. The order is load-bearing: `last_sent` diffs snapshots for
-/// send-on-change, which only works when equal state renders equally.
+/// ascending, each stamped `live` when it is the branch that session is on
+/// (`keys`: session -> live (root, branch)). The order is load-bearing:
+/// `last_sent` diffs snapshots for send-on-change, which only works when
+/// equal state renders equally.
 fn snapshot(
     roots: &HashMap<String, String>,
+    keys: &HashMap<String, (String, String)>,
     cache: &HashMap<(String, String), Entry>,
 ) -> HashMap<String, Vec<Badge>> {
     roots
         .iter()
         .filter_map(|(session, root)| {
+            let live = keys.get(session);
             let mut badges: Vec<Badge> = cache
                 .iter()
                 .filter(|((r, _), _)| r == root)
                 .filter_map(|(_, e)| match &e.fetched {
-                    Fetched::Badge(b) => Some(b.clone()),
+                    Fetched::Badge(b) => {
+                        let mut b = b.clone();
+                        b.live = live.is_some_and(|(r, br)| {
+                            *r == b.root && *br == b.branch
+                        });
+                        Some(b)
+                    },
                     _ => None,
                 })
                 .collect();
@@ -672,6 +690,7 @@ pub fn rollup(json: &str, root: &str, branch: &str) -> Option<Badge> {
     Some(Badge {
         number,
         url,
+        title: title.to_string(),
         kind,
         // The branch leads: with several chips on one pane, the tooltip
         // is what says which is which.
@@ -681,6 +700,8 @@ pub fn rollup(json: &str, root: &str, branch: &str) -> Option<Badge> {
         ),
         root: root.to_string(),
         branch: branch.to_string(),
+        // Per session, not per PR: `snapshot` stamps it.
+        live: false,
     })
 }
 
@@ -814,10 +835,12 @@ mod tests {
         Badge {
             number,
             url: format!("https://github.com/a/b/pull/{number}"),
+            title: format!("pr {number}"),
             kind,
             detail: format!("#{number}"),
             root: root.to_string(),
             branch: branch.to_string(),
+            live: false,
         }
     }
 
@@ -870,6 +893,7 @@ mod tests {
     /// Every remembered badge under a session's root shows, ascending and
     /// deduped; seeds and errors don't; a detached-HEAD session (root
     /// without branch) still gets its root's chips; roots stay isolated.
+    /// Only the badge of the branch a session is actually on is `live`.
     #[test]
     fn snapshot_gathers_by_root() {
         let roots: HashMap<String, String> = [
@@ -877,6 +901,13 @@ mod tests {
             ("mux-detached".to_string(), "/repo".to_string()),
             ("mux-b".to_string(), "/other".to_string()),
             ("mux-quiet".to_string(), "/quiet".to_string()),
+        ]
+        .into();
+        // mux-a sits on feat-b; the detached session has no branch at all.
+        let keys: HashMap<String, (String, String)> = [
+            ("mux-a".to_string(), key("/repo", "feat-b")),
+            ("mux-b".to_string(), key("/other", "main")),
+            ("mux-quiet".to_string(), key("/quiet", "main")),
         ]
         .into();
         let cache: HashMap<(String, String), Entry> = [
@@ -914,15 +945,28 @@ mod tests {
         ]
         .into();
 
-        let snap = snapshot(&roots, &cache);
+        let snap = snapshot(&roots, &keys, &cache);
         let nums = |s: &str| -> Vec<u64> {
             snap.get(s)
                 .map(|v| v.iter().map(|b| b.number).collect())
                 .unwrap_or_default()
         };
+        let live = |s: &str| -> Vec<u64> {
+            snap.get(s)
+                .map(|v| {
+                    v.iter().filter(|b| b.live).map(|b| b.number).collect()
+                })
+                .unwrap_or_default()
+        };
         assert_eq!(nums("mux-a"), vec![4, 9]);
         assert_eq!(nums("mux-detached"), vec![4, 9]);
         assert_eq!(nums("mux-b"), vec![1]);
+        // Live follows the session's branch, not the root: mux-a on feat-b
+        // has #9 live and #4 (feat-a, remembered) not; the detached session
+        // shares the root's chips but is on no branch, so none are live.
+        assert_eq!(live("mux-a"), vec![9]);
+        assert_eq!(live("mux-detached"), Vec::<u64>::new());
+        assert_eq!(live("mux-b"), vec![1]);
         // all-quiet sessions are absent, not empty (matches the old
         // single-badge semantics the App renders against)
         assert!(!snap.contains_key("mux-quiet"));

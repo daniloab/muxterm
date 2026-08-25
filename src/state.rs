@@ -27,6 +27,12 @@ pub struct StateFile {
     /// Whether the sidebar's open-PRs section is folded away.
     #[serde(default)]
     pub prs_collapsed: bool,
+    /// Open PRs the user hid from the sidebar's section (its row's ✕), as
+    /// (`owner/name`, number). Pruned by the App once a successful search no
+    /// longer lists one, so a hidden PR that closes doesn't linger here.
+    /// Additive with `#[serde(default)]` (none hidden).
+    #[serde(default)]
+    pub hidden_prs: Vec<(String, u64)>,
     /// Whether the sidebar's live-workspace list is folded to its header.
     #[serde(default)]
     pub workspaces_collapsed: bool,
@@ -434,6 +440,7 @@ mod tests {
             sidebar_open: true,
             archived_collapsed: false,
             prs_collapsed: false,
+            hidden_prs: vec![("herval/muxterm".into(), 12)],
             workspaces_collapsed: true,
             projects: vec![
                 ProjectState {
@@ -542,6 +549,7 @@ mod tests {
         // Every sidebar fold survives the trip, the live list included.
         assert!(back.workspaces_collapsed);
         assert!(!back.prs_collapsed);
+        assert_eq!(back.hidden_prs, vec![("herval/muxterm".to_string(), 12)]);
         let ws = back.windows[0].tabs[1].workspace.as_ref().unwrap();
         assert_eq!(ws.title, "wire up auth");
         assert_eq!(ws.worktree.as_ref().unwrap().branch, "wire-up-auth");

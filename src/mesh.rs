@@ -808,6 +808,7 @@ mod tests {
             sidebar_open: true,
             archived_collapsed: false,
             prs_collapsed: false,
+            hidden_prs: Vec::new(),
             workspaces_collapsed: false,
             projects: Vec::new(),
             templates: Vec::new(),

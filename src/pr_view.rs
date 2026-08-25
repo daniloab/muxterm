@@ -76,9 +76,14 @@ fn line_color(line: &str, t: &UiTheme) -> Color32 {
     }
 }
 
+/// `checked_out` is whether some workspace already has this PR's branch
+/// (the App's `pr_tab`, asked every frame so a checkout landing or a tab
+/// dying while the overlay is up can't leave a stale button): then the
+/// accent button goes to that workspace instead of checking out again.
 pub fn show(
     ctx: &egui::Context,
     preview: &Preview,
+    checked_out: bool,
     font: &FontId,
     t: &UiTheme,
 ) -> Outcome {
@@ -142,13 +147,21 @@ pub fn show(
                         {
                             outcome = Outcome::OpenInBrowser;
                         }
+                        let (label, hint) = if checked_out {
+                            (
+                                "go to workspace →",
+                                "switch to the workspace that has it checked out",
+                            )
+                        } else {
+                            ("check out ↓", "check out as a worktree workspace")
+                        };
                         if ui
                             .button(
-                                egui::RichText::new("check out ↓")
+                                egui::RichText::new(label)
                                     .font(font.clone())
                                     .color(t.accent),
                             )
-                            .on_hover_text("check out as a worktree workspace")
+                            .on_hover_text(hint)
                             .clicked()
                         {
                             outcome = Outcome::Checkout;

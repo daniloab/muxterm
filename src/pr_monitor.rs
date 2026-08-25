@@ -56,6 +56,28 @@ pub struct PrItem {
     pub draft: bool,
 }
 
+impl PrItem {
+    /// The same PR as the pane HUD's chip knows it (`pr_status::Badge`), so
+    /// a chip can open the overlay `fetch_text` feeds. The badge carries no
+    /// `owner/name` - `gh pr view --json` has no such field - but its URL
+    /// does: the two path segments before `/pull/`, on any host.
+    pub fn from_badge(b: &crate::pr_status::Badge) -> Option<Self> {
+        let base = crate::links::pr_base(&b.url)?;
+        let mut segs = base.rsplit('/');
+        let name = segs.next().filter(|s| !s.is_empty())?;
+        let owner = segs.next().filter(|s| !s.is_empty())?;
+        // A bare `owner/name` with no host is not a URL we know.
+        segs.next()?;
+        Some(Self {
+            number: b.number,
+            repo: format!("{owner}/{name}"),
+            title: b.title.clone(),
+            url: b.url.clone(),
+            draft: b.kind == crate::pr_status::Kind::Draft,
+        })
+    }
+}
+
 /// What the sidebar shows. An empty list with a `note` is a section that can
 /// explain itself; an empty list without one simply means no open PRs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -368,6 +390,46 @@ mod tests {
         // when the head branch is fetched later.
         assert_eq!(items[1].repo, "herval/muxterm");
         assert!(items[1].draft, "a draft PR is marked as one");
+    }
+
+    fn badge(url: &str, kind: crate::pr_status::Kind) -> crate::pr_status::Badge {
+        crate::pr_status::Badge {
+            number: 12,
+            url: url.to_string(),
+            title: "Fix parser".into(),
+            kind,
+            detail: "#12 Fix parser\nfeat-x · open".into(),
+            root: "/repo".into(),
+            branch: "feat-x".into(),
+            live: true,
+        }
+    }
+
+    /// A HUD badge becomes the item the overlay reads: repo spelled as
+    /// `owner/name` out of the URL (whatever the host), draft from the kind.
+    #[test]
+    fn item_from_badge_reads_the_repo_off_the_url() {
+        use crate::pr_status::Kind;
+        let item =
+            PrItem::from_badge(&badge("https://github.com/herval/muxterm/pull/12", Kind::Ok))
+                .expect("github url");
+        assert_eq!(item, PrItem {
+            number: 12,
+            repo: "herval/muxterm".into(),
+            title: "Fix parser".into(),
+            url: "https://github.com/herval/muxterm/pull/12".into(),
+            draft: false,
+        });
+        let ghes = PrItem::from_badge(&badge(
+            "https://git.corp.example/Acme/Widgets/pull/12",
+            Kind::Draft,
+        ))
+        .expect("enterprise url");
+        assert_eq!(ghes.repo, "Acme/Widgets");
+        assert!(ghes.draft, "a draft kind is a draft item");
+        // Not a PR URL: nothing to read.
+        assert!(PrItem::from_badge(&badge("https://github.com/herval", Kind::Ok)).is_none());
+        assert!(PrItem::from_badge(&badge("herval/muxterm/pull/12", Kind::Ok)).is_none());
     }
 
     #[test]

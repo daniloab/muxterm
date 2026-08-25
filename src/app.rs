@@ -136,9 +136,12 @@ pub struct App {
     prs_collapsed: bool,
     /// PRs whose checkout is in flight, so a second click can't double-open.
     pr_opening: HashSet<(String, u64)>,
-    /// (repo, number) -> head branch, once gh has told us. Also what lets a
-    /// row know it is already open in a workspace that was made some other
-    /// way (cmd+n on the branch, long before the PR existed).
+    /// PRs the user hid from the section (a row's ✕). Persisted in
+    /// state.json; pruned once a successful search stops listing one.
+    pr_hidden: HashSet<(String, u64)>,
+    /// (repo, number) -> head branch, once gh has told us. Also one of the
+    /// ways `pr_tab` knows a PR is already open in a workspace made some
+    /// other way (cmd+n on the branch, long before the PR existed).
     pr_head: HashMap<(String, u64), String>,
     pr_head_tx: Sender<(String, u64, Option<pr_monitor::Head>)>,
     pr_head_rx: Receiver<(String, u64, Option<pr_monitor::Head>)>,
@@ -435,6 +438,7 @@ impl App {
             pr_monitor_enabled,
             prs_collapsed: false,
             pr_opening: HashSet::new(),
+            pr_hidden: HashSet::new(),
             pr_head: HashMap::new(),
             pr_head_tx,
             pr_head_rx,
@@ -523,6 +527,7 @@ impl App {
                 app.sidebar_open = saved.sidebar_open;
                 app.archived_collapsed = saved.archived_collapsed;
                 app.prs_collapsed = saved.prs_collapsed;
+                app.pr_hidden = saved.hidden_prs.iter().cloned().collect();
                 app.automations_collapsed = saved.automations_collapsed;
                 app.workspaces_collapsed = saved.workspaces_collapsed;
                 app.automations = saved
@@ -894,6 +899,18 @@ impl App {
         }
         self.active = i;
         self.dirty = true;
+    }
+
+    /// Bring a tab to the foreground wherever it is - out of the archived
+    /// pile if that is where it sits. What "go to the workspace that has
+    /// this PR" means.
+    fn reveal_tab(&mut self, i: usize) {
+        if self.tabs.get(i).is_some_and(|t| t.workspace.is_archived()) {
+            self.unarchive_tab(i);
+        } else if i < self.tabs.len() {
+            self.active = i;
+            self.dirty = true;
+        }
     }
 
     /// The archived row's armed ✕: kill the workspace's tmux sessions, drop
@@ -2998,6 +3015,12 @@ impl App {
             sidebar_open: self.sidebar_open,
             archived_collapsed: self.archived_collapsed,
             prs_collapsed: self.prs_collapsed,
+            // Sorted so the file doesn't churn with HashSet order.
+            hidden_prs: {
+                let mut v: Vec<_> = self.pr_hidden.iter().cloned().collect();
+                v.sort();
+                v
+            },
             workspaces_collapsed: self.workspaces_collapsed,
             projects: self.projects.iter().map(|p| p.to_state()).collect(),
             templates: self.templates.iter().map(|t| t.to_state()).collect(),
@@ -3867,6 +3890,43 @@ impl App {
     /// click resolves the branch off-thread; once it is known (and cached)
     /// the second phase decides between three outcomes, only one of which
     /// creates anything.
+    /// The PRs a tab has checked out right now: its panes' `live` badges
+    /// (the branch each pane is on), deduped and in PR-number order. Empty
+    /// when PR chips are off - the badge map also feeds `pr_detector`, so
+    /// the chips gate on their own config, as the HUD's do.
+    fn tab_prs(&self, tab: &Tab) -> Vec<&pr_status::Badge> {
+        if !self.pr_status {
+            return Vec::new();
+        }
+        live_prs(tab.panes.values().map(|p| p.session.as_str()), &self.pr)
+    }
+
+    /// The tab that has this PR checked out, if any: the one the sidebar
+    /// made for it (`Workspace.pr`), one whose pane sits on its branch (a
+    /// live badge), or a worktree on the head branch a checkout already
+    /// resolved. This is what drops a PR from the sidebar's list and turns
+    /// the overlay's "check out" into "go to workspace".
+    fn pr_tab(&self, repo: &str, number: u64) -> Option<usize> {
+        let same_repo = |r: &str| r.eq_ignore_ascii_case(repo);
+        let head = self.pr_head.get(&(repo.to_string(), number));
+        self.tabs.iter().position(|t| {
+            let ws = &t.workspace;
+            if ws.pr.as_ref().is_some_and(|(r, n)| *n == number && same_repo(r))
+            {
+                return true;
+            }
+            if head.is_some_and(|h| {
+                ws.worktree.as_ref().is_some_and(|w| w.branch == *h)
+            }) {
+                return true;
+            }
+            self.tab_prs(t).into_iter().any(|b| {
+                b.number == number
+                    && PrItem::from_badge(b).is_some_and(|i| same_repo(&i.repo))
+            })
+        })
+    }
+
     fn checkout_pr(&mut self, ctx: &egui::Context, item: PrItem) {
         let key = (item.repo.clone(), item.number);
         if let Some(branch) = self.pr_head.get(&key).cloned() {
@@ -3929,11 +3989,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|w| w.branch == branch)
         }) {
-            if self.tabs[i].workspace.is_archived() {
-                self.unarchive_tab(i);
-            }
-            self.active = i;
-            self.dirty = true;
+            self.reveal_tab(i);
             return;
         }
         let root = self.pr_repo_root(&item.repo);
@@ -4029,8 +4085,17 @@ impl App {
         let Some(preview) = self.pr_preview.as_ref() else {
             return;
         };
-        let outcome =
-            pr_view::show(ctx, preview, &self.font, &self.ui_theme);
+        // Asked every frame, not stored at open: a checkout can land (or
+        // its tab die) while the overlay is up, and the button must say
+        // which it is now.
+        let open_in = self.pr_tab(&preview.item.repo, preview.item.number);
+        let outcome = pr_view::show(
+            ctx,
+            preview,
+            open_in.is_some(),
+            &self.font,
+            &self.ui_theme,
+        );
         match outcome {
             pr_view::Outcome::None => {},
             pr_view::Outcome::Close => self.pr_preview = None,
@@ -4038,11 +4103,15 @@ impl App {
                 ctx.open_url(egui::OpenUrl::new_tab(&preview.item.url));
             },
             pr_view::Outcome::Checkout => {
-                // Reading it was enough to decide: turn the look into a
-                // workspace and get out of the way.
+                // Reading it was enough to decide: go to the workspace that
+                // has it, else turn the look into one - and get out of the
+                // way either way.
                 let item = preview.item.clone();
                 self.pr_preview = None;
-                self.checkout_pr(ctx, item);
+                match open_in {
+                    Some(i) => self.reveal_tab(i),
+                    None => self.checkout_pr(ctx, item),
+                }
             },
         }
     }
@@ -4440,6 +4509,19 @@ impl eframe::App for App {
         }
         while let Ok(snapshot) = self.pr_list_rx.try_recv() {
             self.pr_list = snapshot;
+            // A hidden PR that a *successful* search no longer lists has
+            // closed or merged: forget it, so a reopened one shows again.
+            // A failed search (empty with a note) says nothing about them.
+            if self.pr_list.note.is_none() && !self.pr_hidden.is_empty() {
+                let before = self.pr_hidden.len();
+                let items = &self.pr_list.items;
+                self.pr_hidden.retain(|(r, n)| {
+                    items.iter().any(|it| it.number == *n && it.repo == *r)
+                });
+                if self.pr_hidden.len() != before {
+                    self.dirty = true;
+                }
+            }
         }
         self.drain_pr_heads(ctx);
         while let Ok((repo, number, text)) = self.pr_text_rx.try_recv() {
@@ -4634,6 +4716,15 @@ impl eframe::App for App {
                         delete_armed: ws.is_archived()
                             && self.delete_armed.as_deref()
                                 == Some(tab.tab_id.as_str()),
+                        prs: self
+                            .tab_prs(tab)
+                            .into_iter()
+                            .map(|b| sidebar::PrChip {
+                                number: b.number,
+                                kind: b.kind,
+                                detail: b.detail.clone(),
+                            })
+                            .collect(),
                     }
                 })
                 .collect();
@@ -4653,14 +4744,24 @@ impl eframe::App for App {
                     bt.cmp(&at)
                 },
             });
-            // A PR is "checked out" when some tab's worktree sits on its
-            // head branch. The branch is only known once a checkout has
-            // happened, so this matches on the worktree we created.
+            // A PR some workspace has checked out (`pr_tab`) leaves the
+            // list: it is already a row above, wearing the PR as a chip,
+            // and this section is the PRs you *could* pull in. So does one
+            // the user hid with its ✕. Filtered after `enumerate` so
+            // `index` still addresses `pr_list.items`, which is what the
+            // row's actions carry.
             let prs: Vec<sidebar::PrRow> = self
                 .pr_list
                 .items
                 .iter()
                 .enumerate()
+                .filter(|(_, it)| {
+                    !self
+                        .pr_hidden
+                        .iter()
+                        .any(|(r, n)| *n == it.number && *r == it.repo)
+                        && self.pr_tab(&it.repo, it.number).is_none()
+                })
                 .map(|(index, it)| sidebar::PrRow {
                     index,
                     number: it.number,
@@ -4670,11 +4771,6 @@ impl eframe::App for App {
                     busy: self
                         .pr_opening
                         .contains(&(it.repo.clone(), it.number)),
-                    checked_out: self.tabs.iter().position(|t| {
-                        t.workspace.pr.as_ref().is_some_and(|(r, n)| {
-                            r == &it.repo && *n == it.number
-                        })
-                    }),
                 })
                 .collect();
             // The section is present whenever the extra is on - empty
@@ -4747,9 +4843,40 @@ impl eframe::App for App {
                             ctx.open_url(egui::OpenUrl::new_tab(&item.url));
                         }
                     },
+                    SidebarAction::DismissPr(i) => {
+                        if let Some(item) = self.pr_list.items.get(i) {
+                            self.pr_hidden
+                                .insert((item.repo.clone(), item.number));
+                            self.dirty = true;
+                        }
+                    },
                     SidebarAction::PreviewPr(i) => {
                         if let Some(item) = self.pr_list.items.get(i).cloned() {
                             self.preview_pr(ctx, item);
+                        }
+                    },
+                    // A workspace row's chip: the badge is the HUD's, so
+                    // the overlay reads the same PR the pane's chip names.
+                    SidebarAction::PreviewTabPr { tab, number } => {
+                        let item = self.tabs.get(tab).and_then(|t| {
+                            self.tab_prs(t)
+                                .into_iter()
+                                .find(|b| b.number == number)
+                                .and_then(PrItem::from_badge)
+                        });
+                        if let Some(item) = item {
+                            self.preview_pr(ctx, item);
+                        }
+                    },
+                    SidebarAction::OpenTabPr { tab, number } => {
+                        let url = self.tabs.get(tab).and_then(|t| {
+                            self.tab_prs(t)
+                                .into_iter()
+                                .find(|b| b.number == number)
+                                .map(|b| b.url.clone())
+                        });
+                        if let Some(url) = url {
+                            ctx.open_url(egui::OpenUrl::new_tab(&url));
                         }
                     },
                     SidebarAction::ReorderWorkspace { moved, before } => {
@@ -5462,14 +5589,13 @@ fn draw_pane_title(
         );
         painter.galley(chip.min + pad + Vec2::new(icon_w, 0.0), galley, color);
         // A merged/closed chip can be right-clicked away - unless the
-        // pane still sits on its branch (the scan would just re-learn
-        // it next tick, so don't offer).
+        // pane still sits on its branch (`live`: the scan would just
+        // re-learn it next tick, so don't offer).
         let done = matches!(
             b.kind,
             pr_status::Kind::Merged | pr_status::Kind::Neutral
         );
-        let dismissable =
-            done && !git.is_some_and(|g| g.branch == b.branch);
+        let dismissable = done && !b.live;
         let hover = if dismissable {
             format!("{}\nright-click to dismiss", b.detail)
         } else {
@@ -5873,6 +5999,25 @@ fn in_workspace_list(ws: &Workspace) -> bool {
     !ws.is_automation()
 }
 
+/// The PRs a set of panes (a tab's) have checked out: each session's badges
+/// kept only when `live` - the pane is *on* that branch, not merely in a
+/// checkout that remembers it - deduped (two panes in one worktree carry
+/// the same badges) and sorted by number, because `panes` is a HashMap and
+/// a chip order that jittered between frames would read as churn.
+fn live_prs<'a, 's>(
+    sessions: impl Iterator<Item = &'s str>,
+    badges: &'a HashMap<String, Vec<pr_status::Badge>>,
+) -> Vec<&'a pr_status::Badge> {
+    let mut prs: Vec<&pr_status::Badge> = sessions
+        .filter_map(|s| badges.get(s))
+        .flatten()
+        .filter(|b| b.live)
+        .collect();
+    prs.sort_by_key(|b| b.number);
+    prs.dedup_by_key(|b| b.number);
+    prs
+}
+
 /// Gutter glyphs a boxed TUI prefixes its wrapped rows with - codex `| `,
 /// claude code `⎿ `, tree-drawn `└ `/`├ `/`│ `. The same set egui_term's
 /// link joiner treats as chrome (patch P27), kept in step with it.
@@ -6165,10 +6310,12 @@ mod tests {
         let badge = |n: u64, kind| pr_status::Badge {
             number: n,
             url: format!("https://github.com/a/b/pull/{n}"),
+            title: format!("pr {n}"),
             kind,
             detail: format!("#{n}"),
             root: "/repo".into(),
             branch: format!("feat-{n}"),
+            live: false,
         };
         let badges = vec![
             badge(4, pr_status::Kind::Merged),
@@ -6472,6 +6619,41 @@ mod tests {
         assert_eq!(step_visible_target(&visible, 1, -1), Some(2));
     }
 
+    /// A tab's checked-out PRs are its panes' *live* badges only, once
+    /// each and in number order - whichever pane the HashMap yields first.
+    #[test]
+    fn live_prs_keeps_the_current_branch_once_and_ordered() {
+        let badge = |n: u64, live: bool| pr_status::Badge {
+            number: n,
+            url: format!("https://github.com/a/b/pull/{n}"),
+            title: format!("pr {n}"),
+            kind: pr_status::Kind::Ok,
+            detail: format!("#{n}"),
+            root: "/repo".into(),
+            branch: format!("feat-{n}"),
+            live,
+        };
+        let mut badges: HashMap<String, Vec<pr_status::Badge>> = HashMap::new();
+        // Two panes in the same worktree: identical badges, #9 live on
+        // both, #4 remembered but not checked out.
+        badges.insert("mux-a".into(), vec![badge(4, false), badge(9, true)]);
+        badges.insert("mux-b".into(), vec![badge(4, false), badge(9, true)]);
+        // A third pane elsewhere in the tab, on another PR's branch.
+        badges.insert("mux-c".into(), vec![badge(2, true)]);
+        badges.insert("mux-other-tab".into(), vec![badge(1, true)]);
+
+        let nums = |sessions: &[&str]| -> Vec<u64> {
+            live_prs(sessions.iter().copied(), &badges)
+                .into_iter()
+                .map(|b| b.number)
+                .collect()
+        };
+        assert_eq!(nums(&["mux-b", "mux-c", "mux-a"]), vec![2, 9]);
+        assert_eq!(nums(&["mux-a"]), vec![9]);
+        // A pane with no badges yet contributes nothing, not an error.
+        assert_eq!(nums(&["mux-new"]), Vec::<u64>::new());
+    }
+
     #[test]
     fn split_bar_reserves_the_edge_and_skips_short_panes() {
         use crate::theme::BarEdge::*;
@@ -6529,10 +6711,12 @@ mod tests {
         let badges = vec![pr_status::Badge {
             number: 7,
             url: "https://github.com/a/b/pull/7".into(),
+            title: "pr 7".into(),
             kind: pr_status::Kind::Ok,
             detail: "#7".into(),
             root: "/repo".into(),
             branch: "feat-7".into(),
+            live: false,
         }];
         let pane =
             Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(880.0, 680.0));

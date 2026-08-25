@@ -40,8 +40,18 @@ pub enum SidebarAction {
     CheckoutPr(usize),
     /// Open this PR on github.com (a PR row's right-click).
     OpenPr(usize),
+    /// Hide this PR from the section (a PR row's ✕): it stays hidden across
+    /// relaunches until it is no longer open.
+    DismissPr(usize),
     /// Read this PR in a pane without checking it out (a PR row's body click).
     PreviewPr(usize),
+    /// Read a PR a workspace has checked out (a workspace row's PR chip
+    /// click): `tab` is the row's tab index, `number` picks the chip. Both
+    /// are resolved in the same frame's action loop, one click per frame,
+    /// so neither can go stale the way a batched index would.
+    PreviewTabPr { tab: usize, number: u64 },
+    /// Open a workspace's PR on github.com (a chip's right-click).
+    OpenTabPr { tab: usize, number: u64 },
     /// Open the creation popup (the header "+").
     NewWorkspace,
     /// A row was dragged to a new position: move `moved` so it sits before
@@ -113,10 +123,24 @@ pub struct Row {
     /// state by stable tab id and sets this per frame, so a tab-index shuffle
     /// can never arm the wrong row.
     pub delete_armed: bool,
+    /// The PRs of the branch this workspace is on right now (the HUD badges
+    /// marked `live`), PR number ascending. Chips on the row's title line.
+    pub prs: Vec<PrChip>,
 }
 
-/// One of the user's open PRs. Deliberately not a `Row`: that is indexed by
-/// tab, and a PR has no tab until it is checked out.
+/// One PR chip on a workspace row, drawn the way the pane HUD draws its
+/// badges - state icon plus `#number`. Its click reads the PR in the overlay
+/// (the same one a PR-section row opens); right-click opens github.
+pub struct PrChip {
+    pub number: u64,
+    pub kind: crate::pr_status::Kind,
+    /// Hover text, the badge's: "#12 title\nbranch · status".
+    pub detail: String,
+}
+
+/// One of the user's open PRs *not* checked out anywhere - a checked-out one
+/// is already a workspace row (with a chip) and leaves this list. Deliberately
+/// not a `Row`: that is indexed by tab, and a PR here has no tab.
 pub struct PrRow {
     /// Index into the caller's PR list - the same role `tab_index` plays.
     pub index: usize,
@@ -127,8 +151,6 @@ pub struct PrRow {
     pub draft: bool,
     /// A checkout already in flight: the row is inert until it lands.
     pub busy: bool,
-    /// Already checked out in some tab - clicking selects that tab instead.
-    pub checked_out: Option<usize>,
 }
 
 /// One saved automation. Like `PrRow` this is indexed by position in the
@@ -357,12 +379,16 @@ pub fn show(
     actions
 }
 
-/// Map a row's clicks into the action they mean. The icons win over a body
-/// click (they overlap): the ✕ on an archived row arms, then deletes; the
-/// ↓/↑ archives or restores; a plain body click selects (a peek for
-/// archived).
+/// Map a row's clicks into the action they mean. The icons and chips win
+/// over a body click (they overlap): a PR chip reads (or, right-clicked,
+/// opens) its PR; the ✕ on an archived row arms, then deletes; the ↓/↑
+/// archives or restores; a plain body click selects (a peek for archived).
 fn row_action(r: &RowResponse, row: &Row) -> Option<SidebarAction> {
-    if r.delete && row.archived {
+    if let Some(number) = r.chip_open {
+        Some(SidebarAction::OpenTabPr { tab: row.tab_index, number })
+    } else if let Some(number) = r.chip {
+        Some(SidebarAction::PreviewTabPr { tab: row.tab_index, number })
+    } else if r.delete && row.archived {
         Some(if row.delete_armed {
             SidebarAction::Delete(row.tab_index)
         } else {
@@ -527,7 +553,9 @@ fn note_row(ui: &mut egui::Ui, note: &str, font: &FontId, t: &UiTheme) {
 /// One open PR. The body click *reads* it - a pane with the PR and its diff,
 /// nothing cloned or checked out - and the ↓ button beside it is the one that
 /// makes a worktree, the way the archive/restore icons work on a workspace
-/// row. Right-click opens it on github.com, matching the pane HUD's PR chips.
+/// row; the ✕ one band inward hides the PR from the section (the archived
+/// row's layout: the destructive-ish icon is the harder one to graze).
+/// Right-click opens it on github.com, matching the pane HUD's PR chips.
 fn pr_row(
     ui: &mut egui::Ui,
     pr: &PrRow,
@@ -536,9 +564,10 @@ fn pr_row(
 ) -> Option<SidebarAction> {
     let pad = Vec2::new(8.0, 5.0);
     let status_w = font.size * 1.1;
-    let dim = pr.busy || pr.checked_out.is_some();
-    let wrap =
-        (ui.available_width() - pad.x * 2.0 - status_w - ICON_W).max(1.0);
+    let dim = pr.busy;
+    // Two hover icons (check out + hide): reserve both bands.
+    let wrap = (ui.available_width() - pad.x * 2.0 - status_w - ICON_W * 2.0)
+        .max(1.0);
 
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap;
@@ -553,8 +582,6 @@ fn pr_row(
     );
     let sub = if pr.busy {
         format!("{} · checking out…", pr.repo)
-    } else if pr.checked_out.is_some() {
-        format!("{} · open", pr.repo)
     } else {
         pr.repo.clone()
     };
@@ -583,7 +610,7 @@ fn pr_row(
         Pos2::new(rect.max.x - pad.x - ICON_W / 2.0, rect.center().y),
         Vec2::splat(ICON_W),
     );
-    let icon_resp = (!pr.busy && pr.checked_out.is_none()).then(|| {
+    let icon_resp = (!pr.busy).then(|| {
         ui.interact(
             icon_rect,
             ui.id().with(("pr_row_checkout", pr.number)),
@@ -592,9 +619,23 @@ fn pr_row(
         .on_hover_text("check out as a worktree")
         .on_hover_cursor(egui::CursorIcon::PointingHand)
     });
+    let hide_rect = Rect::from_center_size(
+        Pos2::new(rect.max.x - pad.x - ICON_W - ICON_W / 2.0, rect.center().y),
+        Vec2::splat(ICON_W),
+    );
+    let hide_resp = (!pr.busy).then(|| {
+        ui.interact(
+            hide_rect,
+            ui.id().with(("pr_row_hide", pr.number)),
+            egui::Sense::click(),
+        )
+        .on_hover_text("hide from this list")
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+    });
 
     let hovered = resp.hovered()
-        || icon_resp.as_ref().is_some_and(|r| r.hovered());
+        || icon_resp.as_ref().is_some_and(|r| r.hovered())
+        || hide_resp.as_ref().is_some_and(|r| r.hovered());
     if hovered {
         ui.painter().rect_filled(
             rect,
@@ -624,12 +665,22 @@ fn pr_row(
         t.text,
     );
     if hovered {
+        let icon_font = FontId::new(font.size * 0.95, font.family.clone());
         if let Some(r) = &icon_resp {
             ui.painter().text(
                 icon_rect.center(),
                 Align2::CENTER_CENTER,
                 "↓",
-                FontId::new(font.size * 0.95, font.family.clone()),
+                icon_font.clone(),
+                if r.hovered() { t.text } else { t.text_dim },
+            );
+        }
+        if let Some(r) = &hide_resp {
+            ui.painter().text(
+                hide_rect.center(),
+                Align2::CENTER_CENTER,
+                "✕",
+                icon_font,
                 if r.hovered() { t.text } else { t.text_dim },
             );
         }
@@ -641,15 +692,14 @@ fn pr_row(
     if resp.secondary_clicked() {
         return Some(SidebarAction::OpenPr(pr.index));
     }
+    if hide_resp.is_some_and(|r| r.clicked()) {
+        return Some(SidebarAction::DismissPr(pr.index));
+    }
     if icon_resp.is_some_and(|r| r.clicked()) {
         return Some(SidebarAction::CheckoutPr(pr.index));
     }
     if resp.clicked() {
-        return Some(match pr.checked_out {
-            // Already a workspace for it: go there rather than re-reading it.
-            Some(tab) => SidebarAction::Select(tab),
-            None => SidebarAction::PreviewPr(pr.index),
-        });
+        return Some(SidebarAction::PreviewPr(pr.index));
     }
     None
 }
@@ -936,7 +986,12 @@ struct RowResponse {
     icon: bool,
     /// The ✕ was clicked (archived rows only; always false otherwise).
     delete: bool,
-    /// Pointer anywhere on the row - body or either icon (the disarm gate).
+    /// A PR chip was clicked: its PR number.
+    chip: Option<u64>,
+    /// A PR chip was right-clicked: its PR number.
+    chip_open: Option<u64>,
+    /// Pointer anywhere on the row - body, either icon, or a chip (the
+    /// disarm gate, and the row highlight).
     hovered: bool,
     /// A drag is hovering this row, and would land on this side of it.
     drop: Option<DropSide>,
@@ -981,9 +1036,36 @@ fn workspace_row(
     // Archived rows carry two hover icons (restore + delete), active rows
     // one; reserve the whole band so wrapping never collides with them.
     let band = if row.archived { ICON_W * 2.0 } else { ICON_W };
+    let content_w = ui.available_width() - pad.x * 2.0 - band - status_w;
+    // PR chips, measured before the title so its wrap leaves them room:
+    // the HUD's chip (state icon + `#N`) in the subtitle's face. Capped at
+    // two thirds of the content width - the title keeps a third and wraps
+    // - dropping the highest numbers first, so a burst of PRs on a narrow
+    // panel can't run the chips into the status icon (the HUD's `fits`
+    // rule). Two chips fit at the panel's default width.
+    let chip_font = FontId::new(font.size * 0.8, font.family.clone());
+    let chip_pad = Vec2::new(3.0, 1.5);
+    let chip_gap = 3.0;
+    let icon_w = chip_font.size * 0.9;
+    let mut chips: Vec<(&PrChip, std::sync::Arc<egui::Galley>)> = Vec::new();
+    let mut chips_w = 0.0;
+    for chip in &row.prs {
+        let galley = ui.fonts(|f| {
+            f.layout_no_wrap(
+                format!("#{}", chip.number),
+                chip_font.clone(),
+                title_color,
+            )
+        });
+        let w = icon_w + galley.size().x + chip_pad.x * 2.0 + chip_gap;
+        if chips_w + w > content_w * 0.67 {
+            break;
+        }
+        chips_w += w;
+        chips.push((chip, galley));
+    }
     let mut job = LayoutJob::default();
-    job.wrap.max_width =
-        (ui.available_width() - pad.x * 2.0 - band - status_w).max(1.0);
+    job.wrap.max_width = (content_w - chips_w).max(1.0);
     job.append(&row.title, 0.0, TextFormat::simple(font.clone(), title_color));
     if let Some(sub) = &row.subtitle {
         job.append(
@@ -1084,9 +1166,40 @@ fn workspace_row(
         })
         .on_hover_cursor(egui::CursorIcon::PointingHand)
     });
+    // The chips' rects: right-to-left from the icon band, centred on the
+    // title's line (a row centre would float between a subtitled row's two
+    // lines). Registered after the body like the icons, so a chip click
+    // never selects the row and a press on one never starts a drag.
+    let line_y =
+        rect.min.y + pad.y + ui.fonts(|f| f.row_height(font)) * 0.52;
+    let mut chip_edge = rect.max.x - pad.x - band;
+    let mut chip_resps: Vec<(Rect, u64, egui::Response)> =
+        Vec::with_capacity(chips.len());
+    for (chip, galley) in &chips {
+        let size = Vec2::new(icon_w + galley.size().x, galley.size().y)
+            + chip_pad * 2.0;
+        let chip_rect = Rect::from_min_size(
+            Pos2::new(chip_edge - chip_gap - size.x, line_y - size.y / 2.0),
+            size,
+        );
+        chip_edge = chip_rect.min.x;
+        let r = ui
+            .interact(
+                chip_rect,
+                ui.id().with(("ws_row_pr", row.tab_id.as_str(), chip.number)),
+                egui::Sense::click(),
+            )
+            .on_hover_text(format!(
+                "{}\nclick to read · right-click opens on github",
+                chip.detail
+            ))
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        chip_resps.push((chip_rect, chip.number, r));
+    }
     let hovered = resp.hovered()
         || icon_resp.hovered()
-        || del_resp.as_ref().is_some_and(|r| r.hovered());
+        || del_resp.as_ref().is_some_and(|r| r.hovered())
+        || chip_resps.iter().any(|(_, _, r)| r.hovered());
 
     // Background first, then text on top - a tinted selection (bg blended
     // toward accent) reads as terminal chrome, not a flat gray box.
@@ -1120,6 +1233,31 @@ fn workspace_row(
         t,
         animate.then(|| ui.input(|i| i.time)),
     );
+    // A neutral tint rather than the HUD's translucent chip fill: that one
+    // is made to sit over terminal content, and over the row's own accent
+    // wash it would vanish. The icon keeps the HUD's state colors.
+    let hud = theme::hud_colors(t);
+    for ((chip, galley), (chip_rect, _, _)) in chips.iter().zip(&chip_resps) {
+        ui.painter().rect_filled(
+            *chip_rect,
+            CornerRadius::same(3),
+            theme::blend(t.bg, t.text, 0.10),
+        );
+        chip.kind.draw_icon(
+            ui.painter(),
+            Pos2::new(
+                chip_rect.min.x + chip_pad.x + icon_w * 0.38,
+                chip_rect.center().y,
+            ),
+            chip_font.size,
+            &hud,
+        );
+        ui.painter().galley(
+            chip_rect.min + chip_pad + Vec2::new(icon_w, 0.0),
+            galley.clone(),
+            title_color,
+        );
+    }
     if hovered {
         let icon_font = FontId::new(font.size * 0.95, font.family.clone());
         ui.painter().text(
@@ -1164,6 +1302,14 @@ fn workspace_row(
         body: resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked(),
         icon: icon_resp.clicked(),
         delete: del_resp.is_some_and(|r| r.clicked()),
+        chip: chip_resps
+            .iter()
+            .find(|(_, _, r)| r.clicked())
+            .map(|(_, n, _)| *n),
+        chip_open: chip_resps
+            .iter()
+            .find(|(_, _, r)| r.secondary_clicked())
+            .map(|(_, n, _)| *n),
         hovered,
         drop,
         released,
@@ -1207,6 +1353,7 @@ mod tests {
                 status: Status::Idle,
                 archived: false,
                 delete_armed: false,
+                prs: Vec::new(),
             },
             Row {
                 tab_index: 1,
@@ -1217,6 +1364,7 @@ mod tests {
                 status: Status::Working,
                 archived: false,
                 delete_armed: false,
+                prs: Vec::new(),
             },
             Row {
                 tab_index: 2,
@@ -1227,6 +1375,7 @@ mod tests {
                 status: Status::Blocked,
                 archived: false,
                 delete_armed: false,
+                prs: Vec::new(),
             },
             Row {
                 tab_index: 3,
@@ -1237,6 +1386,7 @@ mod tests {
                 status: Status::Background,
                 archived: false,
                 delete_armed: false,
+                prs: Vec::new(),
             },
             Row {
                 tab_index: 4,
@@ -1247,6 +1397,7 @@ mod tests {
                 status: Status::Command,
                 archived: false,
                 delete_armed: false,
+                prs: Vec::new(),
             },
         ];
 
@@ -1325,6 +1476,7 @@ mod tests {
                 status: Status::Idle,
                 archived: false,
                 delete_armed: false,
+                prs: Vec::new(),
             },
             Row {
                 tab_index: 1,
@@ -1335,6 +1487,7 @@ mod tests {
                 status: Status::Idle,
                 archived: true,
                 delete_armed: false,
+                prs: Vec::new(),
             },
         ];
 
@@ -1400,6 +1553,7 @@ mod tests {
                 status: Status::Idle,
                 archived: false,
                 delete_armed: false,
+                prs: Vec::new(),
             },
             Row {
                 tab_index: 1,
@@ -1410,6 +1564,7 @@ mod tests {
                 status: Status::Idle,
                 archived: false,
                 delete_armed: false,
+                prs: Vec::new(),
             },
             Row {
                 tab_index: 2,
@@ -1420,6 +1575,7 @@ mod tests {
                 status: Status::Idle,
                 archived: true,
                 delete_armed: false,
+                prs: Vec::new(),
             },
         ];
 
@@ -1492,6 +1648,7 @@ mod tests {
             status: Status::Idle,
             archived: false,
             delete_armed: false,
+            prs: Vec::new(),
         }];
         let screen = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
@@ -1577,6 +1734,7 @@ mod tests {
                 status,
                 archived: false,
                 delete_armed: false,
+                prs: Vec::new(),
             }];
             let mut frame = |ctx: &egui::Context| {
                 let _ = show(ctx, &rows, false, &[], None, false, None, false, false, &font, &th);
@@ -1624,6 +1782,7 @@ mod tests {
             status: Status::Idle,
             archived: false,
             delete_armed: false,
+            prs: Vec::new(),
         }
     }
 
@@ -1637,13 +1796,14 @@ mod tests {
             status: Status::Idle,
             archived: true,
             delete_armed,
+            prs: Vec::new(),
         }
     }
 
     /// The click-to-action mapping: an unarmed ✕ arms, an armed one deletes,
     /// and the delete flag is inert on a non-archived row (which has no ✕ -
     /// the body/icon mapping decides instead).
-    fn pr(index: usize, checked_out: Option<usize>, busy: bool) -> PrRow {
+    fn pr(index: usize, busy: bool) -> PrRow {
         PrRow {
             index,
             number: 9645,
@@ -1651,8 +1811,94 @@ mod tests {
             title: "institution-ramp canary rollback".into(),
             draft: false,
             busy,
-            checked_out,
         }
+    }
+
+    /// A row's PR chips paint `#N` for each live PR - and only for those,
+    /// so a chip-less row shows no number at all.
+    #[test]
+    fn workspace_row_paints_a_chip_per_live_pr() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let chip = |number: u64| PrChip {
+            number,
+            kind: crate::pr_status::Kind::Ok,
+            detail: format!("#{number} title\nfeat · open"),
+        };
+        let rows = vec![
+            Row {
+                tab_index: 0,
+                tab_id: "mux-tab-0".into(),
+                title: "chipped".into(),
+                subtitle: Some("feat".into()),
+                prs: vec![chip(12), chip(34)],
+                ..plain_row()
+            },
+            Row {
+                tab_index: 1,
+                tab_id: "mux-tab-1".into(),
+                title: "bare".into(),
+                ..plain_row()
+            },
+        ];
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let mut frame = |ctx: &egui::Context| {
+            let _ = show(ctx, &rows, false, &[], None, false, None, false, false, &font, &th);
+        };
+        let _ = ctx.run(input.clone(), &mut frame);
+        let output = ctx.run(input, &mut frame);
+        let mut shapes = Vec::new();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut shapes);
+        }
+        let texts: Vec<String> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.iter().any(|t| t == "#12"), "chip #12 missing: {texts:?}");
+        assert!(texts.iter().any(|t| t == "#34"), "chip #34 missing: {texts:?}");
+        assert_eq!(
+            texts.iter().filter(|t| t.starts_with('#')).count(),
+            2,
+            "only the chipped row carries numbers: {texts:?}",
+        );
+    }
+
+    /// A chip click reads its PR and a right-click opens it - and either
+    /// wins over the body click it sits on, or the row would select too.
+    #[test]
+    fn row_action_chip_beats_body() {
+        let r = RowResponse {
+            body: true,
+            icon: false,
+            delete: false,
+            chip: Some(12),
+            chip_open: None,
+            hovered: true,
+            drop: None,
+            released: None,
+        };
+        let row = Row { tab_index: 3, ..plain_row() };
+        assert!(matches!(
+            row_action(&r, &row),
+            Some(SidebarAction::PreviewTabPr { tab: 3, number: 12 })
+        ));
+        let r = RowResponse { chip: None, chip_open: Some(12), ..r };
+        assert!(matches!(
+            row_action(&r, &row),
+            Some(SidebarAction::OpenTabPr { tab: 3, number: 12 })
+        ));
     }
 
     /// The PR section paints its own header and one row per PR, and folds
@@ -1663,7 +1909,7 @@ mod tests {
         let preset = theme::preset("iterm-dark").unwrap();
         let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
         let font = FontId::monospace(14.0);
-        let prs = vec![pr(0, None, false)];
+        let prs = vec![pr(0, false)];
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -1747,6 +1993,7 @@ mod tests {
             status: Status::Idle,
             archived: false,
             delete_armed: false,
+            prs: Vec::new(),
         }];
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1913,7 +2160,7 @@ mod tests {
         let preset = theme::preset("iterm-dark").unwrap();
         let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
         let font = FontId::monospace(14.0);
-        let prs = vec![pr(0, None, false)];
+        let prs = vec![pr(0, false)];
         let screen = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
             Vec2::new(900.0, 700.0),
@@ -1977,6 +2224,8 @@ mod tests {
             body: false,
             icon: false,
             delete: false,
+            chip: None,
+            chip_open: None,
             hovered: false,
             
             drop: Some(side),
@@ -2019,6 +2268,8 @@ mod tests {
                 body: false,
                 icon: false,
                 delete: false,
+                chip: None,
+                chip_open: None,
                 hovered: false,
                 
                 drop: Some(side),
@@ -2149,6 +2400,8 @@ mod tests {
             body: false,
             icon: false,
             delete: false,
+            chip: None,
+            chip_open: None,
             hovered: false,
             
             drop: Some(DropSide::Above),
@@ -2163,6 +2416,8 @@ mod tests {
             body,
             icon,
             delete,
+            chip: None,
+            chip_open: None,
             hovered: true,
             
             drop: None,
