@@ -43,6 +43,10 @@ pub enum Action {
     /// gate lives in App::apply_action, which owns that state.
     SearchNext,
     SearchPrev,
+    /// cmd+p: open/close the workspace switcher (type to filter by title,
+    /// description, branch, #pr). cmd+p rather than the usual cmd+k, which
+    /// is the iTerm-style clear-screen here.
+    ToggleSwitcher,
 }
 
 const TAB_KEYS: [Key; 9] = [
@@ -90,6 +94,7 @@ pub fn drain_shortcuts(ctx: &egui::Context) -> Vec<Action> {
         consume(cmd, Key::CloseBracket, Action::CyclePane(1));
         consume(cmd, Key::Comma, Action::ToggleSettings);
         consume(cmd, Key::F, Action::ToggleSearch);
+        consume(cmd, Key::P, Action::ToggleSwitcher);
         consume(cmd | Modifiers::SHIFT, Key::G, Action::SearchPrev);
         consume(cmd, Key::G, Action::SearchNext);
         for (n, key) in TAB_KEYS.iter().enumerate() {

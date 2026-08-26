@@ -36,6 +36,7 @@ use crate::scrollback;
 use crate::search::{self, SearchBar, SearchOp};
 use crate::settings;
 use crate::sidebar::{self, SidebarAction};
+use crate::switcher::{self, Switcher};
 use muxterm::state::{self, LoadResult, NodeState, StateFile, TabState, WindowState};
 use crate::tabbar::{self, TabBarAction};
 use crate::theme::{self, UiTheme};
@@ -191,6 +192,9 @@ pub struct App {
     last_config_check: Instant,
     /// The cmd+f scrollback-search bar.
     search: SearchBar,
+    /// The cmd+p workspace switcher (switcher.rs): the same keyboard-owning
+    /// machine shape as the search bar.
+    switcher: Switcher,
     agent: &'static Agent,
     /// Cache of `binary_available` probes; misses are evicted on failed
     /// submits so an install-then-retry works without a restart. Pre-warmed
@@ -463,6 +467,7 @@ impl App {
             config_mtime: config::mtime(),
             last_config_check: Instant::now(),
             search: SearchBar::default(),
+            switcher: Switcher::default(),
             agent: style.agent,
             agent_ok: HashMap::new(),
             probe_rx,
@@ -3014,6 +3019,18 @@ impl App {
             },
             Action::SearchNext => self.search_step(SearchOp::Next),
             Action::SearchPrev => self.search_step(SearchOp::Prev),
+            Action::ToggleSwitcher => {
+                if self.switcher.active() {
+                    self.switcher.close();
+                } else if !self.modal_open() {
+                    // One keyboard owner at a time: the other modals' Esc
+                    // handlers run before the intercepts (and the PR
+                    // overlay's Esc is non-consuming), so a switcher stacked
+                    // on one would either lose Esc or make it un-closable.
+                    self.search.close();
+                    self.switcher.open();
+                }
+            },
             Action::CyclePane(step) => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let leaves = tab.tree.leaves();
@@ -3226,6 +3243,132 @@ impl App {
     /// copy-mode search on the bound pane; the resulting redraw (scroll
     /// position, match highlights) comes back through the PTY like any
     /// other tmux output.
+    /// Is some modal that owns Esc up: settings, the PR or automation
+    /// overlay, the cmd+n popup, the dirty-worktree confirm.
+    fn modal_open(&self) -> bool {
+        self.settings_open
+            || self.pr_preview.is_some()
+            || self.automation_preview.is_some()
+            || self.new_workspace.is_some()
+            || !self.confirm_worktree.is_empty()
+    }
+
+    /// Feed the frame's events to the switcher while it is open - the
+    /// `search_intercept` drain - and act on what it decided. Enter is
+    /// resolved *here*, against rows built now, and applied at once rather
+    /// than through the end-of-frame action batch, where an earlier
+    /// ClosePane could have shifted the tab index it names.
+    fn switcher_intercept(&mut self, ctx: &egui::Context) {
+        if !self.switcher.active() {
+            return;
+        }
+        let mut ops = Vec::new();
+        ctx.input_mut(|i| {
+            let events = std::mem::take(&mut i.events);
+            let mut kept = Vec::with_capacity(events.len());
+            for event in events {
+                match self.switcher.on_event(&event) {
+                    switcher::Verdict::Pass => kept.push(event),
+                    switcher::Verdict::Consume => {},
+                    switcher::Verdict::Op(op) => ops.push(op),
+                }
+            }
+            i.events = kept;
+        });
+        for op in ops {
+            match op {
+                switcher::Op::Close => self.switcher.close(),
+                switcher::Op::Jump => {
+                    let rows = self.switcher_rows();
+                    self.switcher.sync(rows.len());
+                    if let Some(e) = rows.get(self.switcher.cursor()) {
+                        // A peek for an archived workspace, like its sidebar
+                        // row: GotoTab activates without unarchiving.
+                        self.apply_action(ctx, Action::GotoTab(e.tab_index));
+                        self.switcher.close();
+                    }
+                },
+            }
+        }
+    }
+
+    /// The switcher's rows for the current query: every listed workspace
+    /// (the sidebar's set and order - live in tab order, archived last),
+    /// carrying what the query can match on. PR numbers come from the
+    /// badges directly (`live_prs`) plus `Workspace.pr`, not `tab_prs`,
+    /// which is gated on the chips being *shown*.
+    fn switcher_rows(&self) -> Vec<switcher::Entry> {
+        let mut entries: Vec<(usize, switcher::Entry)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| in_workspace_list(&tab.workspace))
+            .map(|(i, tab)| {
+                let ws = &tab.workspace;
+                let mut title = ws.title.clone();
+                if self.naming.contains(&tab.tab_id) {
+                    title.push('…');
+                }
+                let mut branches: Vec<String> = Vec::new();
+                if let Some(w) = &ws.worktree {
+                    branches.push(w.branch.clone());
+                }
+                for pane in tab.panes.values() {
+                    if let Some(g) = self.git.get(&pane.session) {
+                        if !g.branch.is_empty() && !branches.contains(&g.branch)
+                        {
+                            branches.push(g.branch.clone());
+                        }
+                    }
+                }
+                let mut prs: Vec<u64> = live_prs(
+                    tab.panes.values().map(|p| p.session.as_str()),
+                    &self.pr,
+                )
+                .into_iter()
+                .map(|b| b.number)
+                .collect();
+                if let Some((_, n)) = &ws.pr {
+                    if !prs.contains(n) {
+                        prs.push(*n);
+                    }
+                }
+                prs.sort_unstable();
+                let folder = ws.root.as_ref().and_then(|r| {
+                    r.file_name().map(|n| n.to_string_lossy().into_owned())
+                });
+                (
+                    i,
+                    switcher::Entry {
+                        tab_index: i,
+                        title,
+                        description: ws.description.clone(),
+                        branches,
+                        prs,
+                        folder,
+                        archived: ws.is_archived(),
+                    },
+                )
+            })
+            .collect();
+        // The sidebar's order: live rows in tab order, archived ones after,
+        // newest-archived first.
+        entries.sort_by(|(ia, a), (ib, b)| match (a.archived, b.archived) {
+            (false, false) => std::cmp::Ordering::Equal,
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+            (true, true) => {
+                let at = self.tabs[*ia].workspace.archived_at.unwrap_or(0);
+                let bt = self.tabs[*ib].workspace.archived_at.unwrap_or(0);
+                bt.cmp(&at)
+            },
+        });
+        switcher::filter(
+            entries.into_iter().map(|(_, e)| e).collect(),
+            self.switcher.query(),
+        )
+    }
+
     fn search_intercept(&mut self, ctx: &egui::Context) {
         if self.settings_open || !self.search.active() {
             return;
@@ -3312,6 +3455,7 @@ impl App {
             || self.new_workspace.is_some()
             || !self.confirm_worktree.is_empty()
             || self.search.active()
+            || self.switcher.active()
         {
             return;
         }
@@ -3392,6 +3536,7 @@ impl App {
         if self.settings_open
             || self.new_workspace.is_some()
             || !self.confirm_worktree.is_empty()
+            || self.switcher.active()
         {
             return;
         }
@@ -3827,7 +3972,7 @@ impl App {
             }
             return;
         }
-        if self.search.active() {
+        if self.search.active() || self.switcher.active() {
             return;
         }
         let Some(tab) = self.tabs.get(self.active) else {
@@ -4558,6 +4703,19 @@ impl eframe::App for App {
             actions.retain(|a| !matches!(a, Action::ToggleSearch));
             self.apply_action(ctx, Action::ToggleSearch);
         }
+        // The switcher toggle, for the same reason (a first character
+        // batched into the cmd+p frame lands in the query, not the PTY).
+        if actions.iter().any(|a| matches!(a, Action::ToggleSwitcher)) {
+            actions.retain(|a| !matches!(a, Action::ToggleSwitcher));
+            self.apply_action(ctx, Action::ToggleSwitcher);
+        }
+        // Any other chord dismisses the switcher and then applies as usual
+        // - cmd+, opens settings, cmd+n the popup - rather than stacking a
+        // second keyboard owner on it.
+        if self.switcher.active() && !actions.is_empty() {
+            self.switcher.close();
+        }
+        self.switcher_intercept(ctx);
         self.search_intercept(ctx);
         self.ai_intercept(ctx);
         self.copy_intercept(ctx);
@@ -5025,6 +5183,7 @@ impl eframe::App for App {
                         || self.new_workspace.is_some()
                         || !self.confirm_worktree.is_empty()
                         || self.search.active()
+                        || self.switcher.active()
                     {
                         PaneId(u64::MAX)
                     } else {
@@ -5214,6 +5373,30 @@ impl eframe::App for App {
                         workspace_popup::ConfirmOutcome::None => {},
                     }
                 }
+            }
+        }
+
+        // The workspace switcher, over everything (it cannot coexist with
+        // the modals above - see ToggleSwitcher). Rows are rebuilt here
+        // too, so a click resolves against what was painted.
+        if self.switcher.active() {
+            let rows = self.switcher_rows();
+            self.switcher.sync(rows.len());
+            match switcher::show(
+                ctx,
+                &self.switcher,
+                &rows,
+                &self.font,
+                &self.ui_theme,
+            ) {
+                switcher::Outcome::None => {},
+                switcher::Outcome::Close => self.switcher.close(),
+                switcher::Outcome::Jump(i) => {
+                    if let Some(e) = rows.get(i) {
+                        self.apply_action(ctx, Action::GotoTab(e.tab_index));
+                    }
+                    self.switcher.close();
+                },
             }
         }
 

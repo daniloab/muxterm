@@ -17,6 +17,7 @@ mod pr_view;
 mod scrollback;
 mod search;
 mod settings;
+mod switcher;
 mod sidebar;
 mod tabbar;
 mod theme;
