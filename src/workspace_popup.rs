@@ -854,7 +854,7 @@ struct Panel<'a> {
 
 impl Panel<'_> {
     fn hairline(&self) -> Stroke {
-        Stroke::new(1.0, self.th.text_dim)
+        Stroke::new(1.0_f32, self.th.text_dim)
     }
 
     /// Restyle egui's built-in widgets (the two TextEdits) to sit inside the
@@ -862,14 +862,14 @@ impl Panel<'_> {
     /// hairline border that turns accent on hover/focus.
     fn style_inputs(&self, ui: &mut egui::Ui) {
         ui.style_mut().override_font_id = Some(self.font.clone());
-        let accent = Stroke::new(1.0, self.th.accent);
+        let accent = Stroke::new(1.0_f32, self.th.accent);
         let v = ui.visuals_mut();
         v.override_text_color = Some(self.th.text);
         v.extreme_bg_color = theme::blend(self.th.bg, self.th.text, 0.06);
         v.selection.bg_fill = theme::blend(self.th.bg, self.th.accent, 0.35);
         v.selection.stroke = accent; // the border of a focused field
         v.widgets.inactive.corner_radius = CornerRadius::ZERO;
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0, self.th.text_dim);
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.th.text_dim);
         v.widgets.hovered.corner_radius = CornerRadius::ZERO;
         v.widgets.hovered.bg_stroke = accent;
         v.widgets.active.corner_radius = CornerRadius::ZERO;
@@ -1324,7 +1324,7 @@ mod tests {
             ..Default::default()
         };
         let agents: Vec<_> = agent::AGENTS.iter().collect();
-        let mut render = |form: &mut NewWorkspaceForm| {
+        let render = |form: &mut NewWorkspaceForm| {
             let mut frame = |ctx: &egui::Context| {
                 let _ = show(ctx, form, &agents, &ui_theme, &font);
             };
@@ -1510,7 +1510,7 @@ mod tests {
             ..Default::default()
         };
         let agents: Vec<_> = agent::AGENTS.iter().collect();
-        let mut render = |form: &mut NewWorkspaceForm| {
+        let render = |form: &mut NewWorkspaceForm| {
             let mut frame = |ctx: &egui::Context| {
                 let _ = show(ctx, form, &agents, &ui_theme, &font);
             };

@@ -1013,7 +1013,7 @@ impl Grid<'_> {
     }
 
     fn hairline(&self) -> Stroke {
-        Stroke::new(1.0, self.th.text_dim)
+        Stroke::new(1.0_f32, self.th.text_dim)
     }
 
     /// Restyle egui's built-in widgets (the Projects tab's TextEdits) to sit
@@ -1023,14 +1023,14 @@ impl Grid<'_> {
     /// deliberately share their look.
     fn style_inputs(&self, ui: &mut egui::Ui) {
         ui.style_mut().override_font_id = Some(self.font.clone());
-        let accent = Stroke::new(1.0, self.th.accent);
+        let accent = Stroke::new(1.0_f32, self.th.accent);
         let v = ui.visuals_mut();
         v.override_text_color = Some(self.th.text);
         v.extreme_bg_color = theme::blend(self.th.bg, self.th.text, 0.06);
         v.selection.bg_fill = theme::blend(self.th.bg, self.th.accent, 0.35);
         v.selection.stroke = accent; // the border of a focused field
         v.widgets.inactive.corner_radius = CornerRadius::ZERO;
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0, self.th.text_dim);
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.th.text_dim);
         v.widgets.hovered.corner_radius = CornerRadius::ZERO;
         v.widgets.hovered.bg_stroke = accent;
         v.widgets.active.corner_radius = CornerRadius::ZERO;

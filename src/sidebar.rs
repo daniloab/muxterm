@@ -2371,7 +2371,7 @@ mod tests {
             Vec2::new(900.0, 700.0),
         );
         let mut seen: Vec<SidebarAction> = Vec::new();
-        let mut frame = |ctx: &egui::Context, input: egui::RawInput| {
+        let frame = |ctx: &egui::Context, input: egui::RawInput| {
             let mut got = Vec::new();
             let _ = ctx.run(input, |ctx| {
                 got = show(
