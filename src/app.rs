@@ -27,6 +27,7 @@ use crate::config;
 use crate::keys::{self, Action};
 use muxterm::layout::{self, Node, PaneId, Removal, SplitAxis};
 use muxterm::mesh;
+use muxterm::models;
 use crate::git_status;
 use crate::pane::Pane;
 use crate::pr_monitor::{self, PrItem};
@@ -189,6 +190,10 @@ pub struct App {
     template_draft: settings::TemplateDraft,
     dirty: bool,
     config_mtime: Option<SystemTime>,
+    /// `models.json` mtime, so `mux models --refresh` lands without a
+    /// relaunch (the probe thread writes it too; re-reading its own write
+    /// is harmless).
+    models_mtime: Option<SystemTime>,
     last_config_check: Instant,
     /// The cmd+f scrollback-search bar.
     search: SearchBar,
@@ -417,8 +422,11 @@ impl App {
         // Pre-warm the binary probes for every registry agent so the
         // settings/popup lists can hide uninstalled CLIs. Each probe spawns
         // an interactive login shell, so it must stay off the UI thread.
+        // Last-known model lists first (one small file read), so the popup
+        // opens on them; the probe thread then refreshes stale ones.
+        models::install(models::load());
         spawn_agent_probe(
-            agent::AGENTS.iter().map(|a| a.bin).collect(),
+            agent::AGENTS.iter().collect(),
             probe_tx.clone(),
             cc.egui_ctx.clone(),
         );
@@ -465,6 +473,7 @@ impl App {
             automation_draft: settings::AutomationDraft::default(),
             dirty: false,
             config_mtime: config::mtime(),
+            models_mtime: models::mtime(),
             last_config_check: Instant::now(),
             search: SearchBar::default(),
             switcher: Switcher::default(),
@@ -4085,12 +4094,11 @@ impl App {
     /// while muxterm runs makes it appear the next time a picker opens.
     /// Known-good bins are not re-probed (each probe costs a login shell).
     fn reprobe_missing_agents(&self, ctx: &egui::Context) {
-        let bins: Vec<_> = agent::AGENTS
+        let agents: Vec<_> = agent::AGENTS
             .iter()
-            .map(|a| a.bin)
-            .filter(|b| self.agent_ok.get(b) == Some(&false))
+            .filter(|a| self.agent_ok.get(a.bin) == Some(&false))
             .collect();
-        spawn_agent_probe(bins, self.probe_tx.clone(), ctx.clone());
+        spawn_agent_probe(agents, self.probe_tx.clone(), ctx.clone());
     }
 
     /// Check a PR out as a worktree workspace.
@@ -4559,6 +4567,11 @@ impl eframe::App for App {
             if mtime != self.config_mtime {
                 self.reload_config(ctx);
                 log::info!("config.toml reloaded");
+            }
+            let models_mtime = models::mtime();
+            if models_mtime != self.models_mtime {
+                self.models_mtime = models_mtime;
+                models::install(models::load());
             }
             let agents_mtime = mesh::registry_mtime();
             if agents_mtime != self.agents_mtime {
@@ -5443,22 +5456,32 @@ impl eframe::App for App {
 
 /// Probe agent binaries on a background thread (each probe spawns an
 /// interactive login shell - see agent::binary_available); results land in
-/// `agent_ok` via `probe_rx` on a later frame.
+/// `agent_ok` via `probe_rx` on a later frame. An installed agent's model
+/// list is refreshed on the same thread when its cache entry is stale
+/// (`models::refresh` - a `--version` probe, then the catalog command only
+/// if the version moved or a day passed); the result goes straight into
+/// the process-global catalog and to `models.json`, no channel needed.
 fn spawn_agent_probe(
-    bins: Vec<&'static str>,
+    agents: Vec<&'static Agent>,
     tx: Sender<(&'static str, bool)>,
     ctx: egui::Context,
 ) {
-    if bins.is_empty() {
+    if agents.is_empty() {
         return;
     }
     thread::spawn(move || {
-        for bin in bins {
-            let ok = agent::binary_available(bin);
-            if tx.send((bin, ok)).is_err() {
+        let mut cache = models::load();
+        for a in agents {
+            let ok = agent::binary_available(a.bin);
+            if tx.send((a.bin, ok)).is_err() {
                 return;
             }
             ctx.request_repaint();
+            if ok && models::refresh(a, &mut cache, false) {
+                models::save(&cache);
+                log::info!("{} model list refreshed", a.id);
+                ctx.request_repaint();
+            }
         }
     });
 }

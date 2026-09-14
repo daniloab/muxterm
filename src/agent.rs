@@ -27,13 +27,18 @@ pub struct Agent {
     pub bin: &'static str,
     /// Model passed as --model when config.toml doesn't name one. A quick
     /// question about pane output doesn't need the CLI's default model,
-    /// which may be a slow flagship; None leaves the choice to the CLI.
+    /// which may be a slow flagship; None leaves the choice to the CLI. A
+    /// preference, not a promise: `models::fast_model` resolves it against
+    /// the live list and falls back to that list's default.
     pub fast_model: Option<&'static str>,
-    /// Models offered in the workspace-creation model dropdown. Curated (not
-    /// every id the CLI accepts) - a bad pick just makes the CLI error; the
-    /// first entry is the dropdown default. An empty entry means "use the
-    /// CLI's configured default" (needed by provider-agnostic agents).
-    pub models: &'static [&'static str],
+    /// The compiled-in model list: what the pickers offer until
+    /// `models::discover` replaces it with the CLI's own catalog, and the
+    /// fallback whenever that fails. Readers go through
+    /// `models::for_agent`, never this field. Curated (not every id the CLI
+    /// accepts) - a bad pick just makes the CLI error; the first entry is
+    /// the picker default. An empty entry means "use the CLI's configured
+    /// default" (needed by provider-agnostic agents).
+    pub seed_models: &'static [&'static str],
     /// Some interactive CLIs take the initial task as a positional argument;
     /// others (OpenCode) reserve that position for a project path and need a
     /// named prompt flag instead.
@@ -51,7 +56,10 @@ pub const AGENTS: &[Agent] = &[
         label: "Claude Code",
         bin: "claude",
         fast_model: Some("haiku"),
-        models: &["opus", "claude-fable-5", "sonnet", "haiku"],
+        // Floating family aliases (each resolves to the family's latest
+        // release inside the CLI), so the seed can't go stale by itself;
+        // models::CLAUDE_ALIASES mirrors it for the discovered list.
+        seed_models: &["opus", "fable", "sonnet", "haiku"],
         prompt_flag: None,
         ask: AskInvocation::ClaudeStream,
         // --max-turns 1: a title/summary needs exactly one model turn. In
@@ -67,7 +75,7 @@ pub const AGENTS: &[Agent] = &[
         label: "Codex",
         bin: "codex",
         fast_model: Some("gpt-5.6-terra"),
-        models: &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+        seed_models: &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
         prompt_flag: None,
         // The write sandbox is deliberate for asks: exec defaults to
         // read-only, but the agent is expected to act on the answer.
@@ -87,7 +95,7 @@ pub const AGENTS: &[Agent] = &[
         // Curated pi model patterns; first = dropdown default. pi is BYOK
         // multi-provider, so these are Claude-family shorthands (the provider
         // this app is used with) - adjust freely, a bad pick just errors.
-        models: &["sonnet", "opus", "haiku"],
+        seed_models: &["sonnet", "opus", "haiku"],
         prompt_flag: None,
         // Print mode acts on its own (runs bash/edit/write) and merges piped
         // stdin into the prompt - exactly the `mux ask` contract. pi has no
@@ -105,7 +113,7 @@ pub const AGENTS: &[Agent] = &[
         // provider-qualified ids; the empty first entry keeps BYOK and local
         // provider setups first-class too.
         fast_model: None,
-        models: &[
+        seed_models: &[
             "",
             "opencode/gpt-5.6-sol",
             "opencode/gpt-5.6-terra",
@@ -207,7 +215,8 @@ pub fn resume_command(agent: &Agent, model: Option<&str>) -> String {
 /// The captured one-shot behind AI workspace-title generation (workspace.rs,
 /// `mux retitle`): non-interactive, fast model, plain-text stdout. Unlike
 /// `launch_command` (interactive, user-picked model), this always uses the
-/// registry's fast_model - a summary line doesn't need a flagship.
+/// registry's fast_model (as `models::fast_model` resolves it) - a summary
+/// line doesn't need a flagship.
 ///
 /// Argv form (bin first), for callers that spawn the process directly: no
 /// shell means no quoting surface and - load-bearing for `mux retitle`'s
@@ -215,9 +224,9 @@ pub fn resume_command(agent: &Agent, model: Option<&str>) -> String {
 pub fn oneshot_argv(agent: &Agent, prompt: &str) -> Vec<String> {
     let mut argv = vec![agent.bin.to_string()];
     argv.extend(agent.oneshot_args.iter().map(|s| s.to_string()));
-    if let Some(m) = agent.fast_model {
+    if let Some(m) = crate::models::fast_model(agent) {
         argv.push("--model".to_string());
-        argv.push(m.to_string());
+        argv.push(m);
     }
     argv.push(prompt.to_string());
     argv
@@ -376,17 +385,17 @@ mod tests {
         assert!(by_id("gpt").is_none());
         assert_eq!(default_agent().id, "claude");
         assert_eq!(default_agent().fast_model, Some("haiku"));
-        assert_eq!(default_agent().models.first(), Some(&"opus"));
+        assert_eq!(default_agent().seed_models.first(), Some(&"opus"));
     }
 
     #[test]
     fn registry_entries_are_coherent() {
         for a in AGENTS {
-            assert!(!a.models.is_empty(), "{} has no models", a.id);
+            assert!(!a.seed_models.is_empty(), "{} has no models", a.id);
             if let Some(fast) = a.fast_model {
                 assert!(
-                    a.models.contains(&fast),
-                    "{}'s fast_model {fast:?} is not in its models list",
+                    a.seed_models.contains(&fast),
+                    "{}'s fast_model {fast:?} is not in its seed list",
                     a.id
                 );
             }
