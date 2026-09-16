@@ -386,6 +386,12 @@ fn show_automations(
         1,
     );
     grid.input_row(ui, &mut draft.folder, "folder to run in", 1);
+    ui.horizontal(|ui| {
+        grid.seg(ui, "  ", th.text_dim, false);
+        if grid.seg(ui, "[ Browse... ]", th.accent, true).clicked() {
+            crate::folder_picker::browse(&mut draft.folder);
+        }
+    });
 
     // Payload: an agent (with a prompt) or a plain command. The row of
     // agents doubles as the switch - picking "command" clears the agent.
@@ -704,6 +710,12 @@ fn show_projects(
         "folder path or github owner/repo",
         1,
     );
+    ui.horizontal(|ui| {
+        grid.seg(ui, "  ", th.text_dim, false);
+        if grid.seg(ui, "[ Browse... ]", th.accent, true).clicked() {
+            crate::folder_picker::browse(&mut draft.location);
+        }
+    });
     grid.input_row(
         ui,
         &mut draft.subfolder,
