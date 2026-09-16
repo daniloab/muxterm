@@ -356,6 +356,14 @@ pub fn show(
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(2.0);
+                if panel
+                    .row(ui, vec![("[ Browse... ]".into(), th.accent)], true)
+                    .on_hover_text("Choose a folder in the native file picker")
+                    .clicked()
+                    && crate::folder_picker::browse(&mut form.folder)
+                {
+                    form.refresh_repo();
+                }
                 if form.is_repo {
                     if panel
                         .toggle(ui, form.create_worktree, "Create git worktree", true)
