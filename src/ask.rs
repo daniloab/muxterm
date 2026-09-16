@@ -255,7 +255,11 @@ pub fn run(
     query: &str,
     context: Option<&str>,
 ) -> Result<i32, String> {
-    let model = model.filter(|m| !m.is_empty()).or(agent.fast_model);
+    let model = model
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .or_else(|| crate::models::fast_model(agent));
+    let model = model.as_deref();
     let spawn_err =
         |e: io::Error| format!("failed to run {}: {e}", agent.bin);
 

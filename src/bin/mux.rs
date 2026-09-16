@@ -21,6 +21,7 @@ use muxterm::ask;
 use muxterm::automation;
 use muxterm::layout::SplitAxis;
 use muxterm::mesh::{self, AgentInfo};
+use muxterm::models;
 use muxterm::state;
 
 const EXIT_TMUX: i32 = 1;
@@ -101,6 +102,12 @@ usage: mux [--as <session>] [--json] <command> [args]
                                in its own tab, which keeps its logs; `run`
                                fires one now. Needs the automations extra
                                switched on in muxterm's settings
+  models [--refresh]           each agent's model list as the pickers see
+                               it - discovered from the CLI (codex's
+                               catalog; claude's aliases plus its org
+                               extras) and cached in models.json, else the
+                               built-in seed. --refresh re-asks every
+                               installed CLI now
   brief                        paste-ready team briefing for a system prompt
   prune                        clean up entries for dead sessions/tabs
 ";
@@ -111,6 +118,9 @@ type CmdResult = Result<(), Fail>;
 fn main() {
     // Either binary may run first; whichever does moves state to ~/.muxterm.
     state::migrate_config_dir();
+    // Last-known agent model lists (the GUI keeps them fresh); `mux ask` and
+    // `mux retitle` resolve their fast model against them like the GUI does.
+    models::install(models::load());
     let args: Vec<String> = env::args().skip(1).collect();
     if let Err((code, msg)) = run(args) {
         eprintln!("mux: {msg}");
@@ -166,6 +176,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
         "inbox" => cmd_inbox(as_session, rest, json),
         "ctx" => cmd_ctx(as_session, rest, json),
         "automations" | "automation" => cmd_automations(rest, json),
+        "models" => cmd_models(rest, json),
         "brief" => cmd_brief(as_session),
         "prune" => cmd_prune(),
         other => {
@@ -2411,6 +2422,68 @@ fn cmd_brief(as_session: Option<String>) -> CmdResult {
     let tmux = Tmux::new()?;
     let sc = scope(&tmux, as_session)?;
     println!("{}", build_brief(&tmux, &sc));
+    Ok(())
+}
+
+/// `mux models [--refresh]`: the lists the pickers offer, with where each
+/// came from. The GUI refreshes on its own when a CLI's version moves or a
+/// day passes; --refresh is the "I just updated codex" shortcut, and the
+/// GUI picks the rewritten file up on its mtime tick.
+fn cmd_models(mut args: Vec<String>, json: bool) -> CmdResult {
+    let refresh = take_flag(&mut args, "--refresh");
+    if let Some(extra) = args.first() {
+        return Err((EXIT_USAGE, format!("unexpected argument {extra:?}")));
+    }
+    let mut cache = models::load();
+    if refresh {
+        let mut changed = false;
+        for a in agent::AGENTS.iter().filter(|a| models::discoverable(a)) {
+            if !agent::binary_available(a.bin) {
+                continue;
+            }
+            if models::refresh(a, &mut cache, true) {
+                changed = true;
+            }
+        }
+        if changed {
+            models::save(&cache);
+        }
+    }
+    if json {
+        let mut out = serde_json::Map::new();
+        for a in agent::AGENTS {
+            let mut row = serde_json::Map::new();
+            row.insert("models".into(), models::for_agent(a.id).into());
+            row.insert("discovered".into(), models::is_discovered(a.id).into());
+            if let Some(e) = cache.get(a.id) {
+                row.insert("version".into(), e.version.clone().into());
+                row.insert("fetched_at".into(), e.fetched_at.into());
+            }
+            out.insert(a.id.to_string(), row.into());
+        }
+        println!("{}", serde_json::Value::Object(out));
+        return Ok(());
+    }
+    let now = models::now_secs();
+    for a in agent::AGENTS {
+        let source = match cache.get(a.id) {
+            Some(e) if models::is_discovered(a.id) => {
+                let age = now.saturating_sub(e.fetched_at);
+                let age = match age {
+                    a if a < 60 => format!("{a}s"),
+                    a if a < 3600 => format!("{}m", a / 60),
+                    a if a < 86400 => format!("{}h", a / 3600),
+                    a => format!("{}d", a / 86400),
+                };
+                format!("{} ago, {}", age, e.version)
+            },
+            _ => "built-in".to_string(),
+        };
+        println!("{} ({source})", a.id);
+        for m in models::for_agent(a.id) {
+            println!("  {}", if m.is_empty() { "(default)" } else { &m });
+        }
+    }
     Ok(())
 }
 

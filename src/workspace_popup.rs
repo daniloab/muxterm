@@ -24,6 +24,7 @@ use egui::{
 };
 
 use muxterm::agent::{self, Agent};
+use muxterm::models;
 
 use crate::theme::{self, UiTheme};
 use crate::workspace::{Branch, BranchChoice, Project, Template};
@@ -357,6 +358,14 @@ pub fn show(
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(2.0);
+                if panel
+                    .row(ui, vec![("[ Browse... ]".into(), th.accent)], true)
+                    .on_hover_text("Choose a folder in the native file picker")
+                    .clicked()
+                    && crate::folder_picker::browse(&mut form.folder)
+                {
+                    form.refresh_repo();
+                }
                 if form.is_repo {
                     if panel
                         .toggle(ui, form.create_worktree, "Create git worktree", true)
@@ -408,9 +417,9 @@ pub fn show(
                     {
                         form.agent = a.id;
                         // Keep the model valid for the newly-picked agent.
-                        if !current_agent(form.agent)
-                            .models
-                            .contains(&form.model.as_str())
+                        if !models::for_agent(form.agent)
+                            .iter()
+                            .any(|m| *m == form.model)
                         {
                             form.model = default_model(form.agent);
                         }
@@ -420,17 +429,20 @@ pub fn show(
 
             panel.divider(ui, "Model", th.accent);
             ui.add_space(2.0);
-            ui.horizontal(|ui| {
+            // Wrapped: a discovered list (codex's catalog runs to seven or
+            // so) outgrows one row, and the segs are allocated widgets so
+            // egui wraps them like any other.
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 panel.seg(ui, " ", th.text_dim, false, false); // 1-cell indent
-                for m in current_agent(form.agent).models {
-                    let selected = form.model == *m;
+                for m in models::for_agent(form.agent) {
+                    let selected = form.model == m;
                     let color = if selected { th.accent } else { th.text };
                     let marker = if selected { "> " } else { "  " };
                     let label =
-                        format!("{marker}{}   ", agent::model_label(m));
+                        format!("{marker}{}   ", agent::model_label(&m));
                     if panel.seg(ui, &label, color, true, selected).clicked() {
-                        form.model = m.to_string();
+                        form.model = m;
                     }
                 }
             });
@@ -1125,17 +1137,11 @@ impl Panel<'_> {
     }
 }
 
-fn current_agent(id: &str) -> &'static Agent {
-    agent::by_id(id).unwrap_or_else(agent::default_agent)
-}
-
-/// The dropdown's default selection for an agent: its first curated model.
+/// The dropdown's default selection for an agent: its first listed model
+/// (discovered when the CLI's catalog is cached, the registry seed
+/// otherwise).
 pub fn default_model(id: &str) -> String {
-    current_agent(id)
-        .models
-        .first()
-        .map(|m| m.to_string())
-        .unwrap_or_default()
+    models::default_model(id)
 }
 
 #[cfg(test)]

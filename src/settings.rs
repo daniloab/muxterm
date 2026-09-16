@@ -19,6 +19,7 @@ use egui::{
 use muxterm::agent::{self, Agent};
 use muxterm::automation::{self, Automation};
 use muxterm::layout::SplitAxis;
+use muxterm::models;
 
 use crate::config;
 use crate::theme::{self, UiTheme};
@@ -393,6 +394,12 @@ fn show_automations(
         1,
     );
     grid.input_row(ui, &mut draft.folder, "folder to run in", 1);
+    ui.horizontal(|ui| {
+        grid.seg(ui, "  ", th.text_dim, false);
+        if grid.seg(ui, "[ Browse... ]", th.accent, true).clicked() {
+            crate::folder_picker::browse(&mut draft.folder);
+        }
+    });
 
     // Payload: an agent (with a prompt) or a plain command. The row of
     // agents doubles as the switch - picking "command" clears the agent.
@@ -475,13 +482,14 @@ fn show_automations(
     });
 }
 
-/// Step to the next model in the agent's curated list, wrapping.
+/// Step to the next model in the agent's list, wrapping.
 fn next_model(a: &'static Agent, current: &str) -> String {
-    if a.models.is_empty() {
+    let list = models::for_agent(a.id);
+    if list.is_empty() {
         return String::new();
     }
-    let at = a.models.iter().position(|m| *m == current).unwrap_or(0);
-    a.models[(at + 1) % a.models.len()].to_string()
+    let at = list.iter().position(|m| m == current).unwrap_or(0);
+    list[(at + 1) % list.len()].clone()
 }
 
 /// Why this draft cannot be saved yet, or None when it can. Pure, so the
@@ -805,6 +813,12 @@ fn show_projects(
         "folder path or github owner/repo",
         1,
     );
+    ui.horizontal(|ui| {
+        grid.seg(ui, "  ", th.text_dim, false);
+        if grid.seg(ui, "[ Browse... ]", th.accent, true).clicked() {
+            crate::folder_picker::browse(&mut draft.location);
+        }
+    });
     grid.input_row(
         ui,
         &mut draft.subfolder,
@@ -1537,14 +1551,15 @@ mod tests {
     #[test]
     fn model_stepper_cycles() {
         let claude = agent::by_id("claude").unwrap();
+        let list = models::for_agent("claude");
         let mut seen = vec![String::new()];
         let mut m = next_model(claude, "");
-        for _ in 0..claude.models.len() {
+        for _ in 0..list.len() {
             seen.push(m.clone());
             m = next_model(claude, &m);
         }
-        // Every curated model shows up, and it comes back round.
-        for want in claude.models {
+        // Every listed model shows up, and it comes back round.
+        for want in &list {
             assert!(seen.iter().any(|s| s == want), "{want} never offered");
         }
     }

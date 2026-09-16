@@ -69,6 +69,10 @@ through your login shell.
 
 ## Shortcuts
 
+Use **Browse...** in New Workspace (cmd+n), Settings > Projects, or the
+automation form to choose a folder with the native file picker. Selecting a
+folder fills the path; cancelling keeps the current value.
+
 | Chord | Action |
 | --- | --- |
 | cmd+t | new tab |
