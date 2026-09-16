@@ -49,6 +49,9 @@ pub enum Tab {
 /// here; `[ add ]` upserts by name - that round trip is the edit path.
 #[derive(Default)]
 pub struct ProjectDraft {
+    pub import: crate::conductor_import::ImportState,
+    pub default_branch: String,
+    pub copy_files: String,
     pub name: String,
     pub location: String,
     /// Repo-relative subfolder (monorepo apps): the workspace worktrees
@@ -118,6 +121,7 @@ pub struct Outcome {
     /// A project to add - or to replace, when a saved project already has
     /// its name. The caller owns the list (state.json).
     pub add_project: Option<Project>,
+    pub import_projects: Vec<Project>,
     /// Index into the caller's project list to remove.
     pub remove_project: Option<usize>,
     /// A template to add - or to replace, when a saved one already has its
@@ -205,7 +209,11 @@ pub fn show(
                     &mut out,
                 ),
                 Tab::Projects => {
-                    show_projects(ui, &grid, th, projects, draft, &mut out)
+                    egui::ScrollArea::vertical()
+                        .max_height((ctx.screen_rect().height() - 120.0).max(160.0))
+                        .show(ui, |ui| {
+                            show_projects(ui, &grid, th, projects, draft, &mut out);
+                        });
                 },
                 Tab::Templates => show_templates(
                     ui, &grid, th, templates, tdraft, &mut out,
@@ -646,6 +654,98 @@ fn show_preferences(
     grid.hint(ui, "type \"?\" at an empty shell prompt to ask");
 }
 
+fn show_conductor_import(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    th: &UiTheme,
+    projects: &[Project],
+    import: &mut crate::conductor_import::ImportState,
+    out: &mut Outcome,
+) {
+    import.poll();
+    if grid
+        .seg(
+            ui,
+            "[ Import from Conductor ]",
+            th.accent,
+            import.pending.is_none(),
+        )
+        .clicked()
+        && import.pending.is_none()
+    {
+        import.start(ui.ctx().clone());
+    }
+    if let Some(message) = &import.message {
+        ui.label(message);
+    }
+    for row in &mut import.candidates {
+        let duplicate =
+            crate::conductor_import::duplicate(&row.project, projects)
+                || crate::conductor_import::duplicate(
+                    &row.project,
+                    &out.import_projects,
+                );
+        if duplicate {
+            row.selected = false;
+        }
+        ui.horizontal(|ui| {
+            ui.add_enabled(
+                !duplicate && row.project.local_root().is_dir(),
+                egui::Checkbox::new(&mut row.selected, &row.project.name),
+            );
+            if duplicate {
+                ui.label("already saved; skipped");
+            }
+        });
+        ui.collapsing(format!("Details: {}", row.project.name), |ui| {
+            ui.label(row.project.local_root().display().to_string());
+            ui.label(format!(
+                "Base: {}",
+                row.project.default_branch.as_deref().unwrap_or("HEAD")
+            ));
+            ui.label(format!("Copy: {}", row.project.copy_files.join(", ")));
+            if let Some(setup) = &row.project.setup {
+                ui.label("Setup (runs when a workspace is created):");
+                ui.monospace(setup);
+            }
+            for warning in &row.warnings {
+                ui.label(warning);
+            }
+        });
+    }
+    let count = import.candidates.iter().filter(|r| r.selected).count();
+    if count > 0 {
+        ui.label("Review details: unsupported settings are not imported.");
+        if grid
+            .seg(
+                ui,
+                &format!("[ Import {count} selected projects ]"),
+                th.accent,
+                true,
+            )
+            .clicked()
+        {
+            let mut merged = projects.to_vec();
+            for row in &import.candidates {
+                if row.selected
+                    && !crate::conductor_import::duplicate(
+                        &row.project,
+                        &merged,
+                    )
+                {
+                    merged.push(row.project.clone());
+                    out.import_projects.push(row.project.clone());
+                }
+            }
+            import.message = Some(format!(
+                "Imported {} projects. Existing projects preserved.",
+                out.import_projects.len()
+            ));
+            import.candidates.clear();
+        }
+    }
+}
+
 fn show_projects(
     ui: &mut egui::Ui,
     grid: &Grid,
@@ -654,9 +754,10 @@ fn show_projects(
     draft: &mut ProjectDraft,
     out: &mut Outcome,
 ) {
+    show_conductor_import(ui, grid, th, projects, &mut draft.import, out);
     grid.divider(ui, "Projects", th.accent);
     if projects.is_empty() {
-        grid.hint(ui, "none yet - cmd+shift+n starts from these");
+        grid.hint(ui, "none yet - cmd+n starts from these");
     }
     for (i, p) in projects.iter().enumerate() {
         // `name  location  [x]`: the row loads the project into the draft
@@ -691,6 +792,8 @@ fn show_projects(
             };
             draft.subfolder = p.subdir.clone().unwrap_or_default();
             draft.setup = p.setup.clone().unwrap_or_default();
+            draft.default_branch = p.default_branch.clone().unwrap_or_default();
+            draft.copy_files = p.copy_files.join("\n");
         }
     }
 
@@ -708,6 +811,8 @@ fn show_projects(
         "subfolder within the repo (optional)",
         1,
     );
+    grid.input_row(ui, &mut draft.default_branch, "base branch (optional, e.g. origin/prod)", 1);
+    grid.input_row(ui, &mut draft.copy_files, "files to copy: one glob per line, ! excludes", 2);
     grid.input_row(ui, &mut draft.setup, "setup script (optional)", 2);
     grid.hint(ui, "new panes cd to the subfolder, then setup");
 
@@ -955,6 +1060,10 @@ fn draft_project(draft: &ProjectDraft) -> Option<Project> {
     let setup = draft.setup.trim();
     let sub = draft.subfolder.trim().trim_matches('/');
     Some(Project {
+        default_branch: (!draft.default_branch.trim().is_empty())
+            .then(|| draft.default_branch.trim().to_string()),
+        copy_files: draft.copy_files.lines().map(str::trim)
+            .filter(|s| !s.is_empty()).map(str::to_string).collect(),
         name,
         path,
         repo,
@@ -1326,6 +1435,8 @@ mod tests {
     fn fixture_projects() -> Vec<Project> {
         vec![
             Project {
+                default_branch: None,
+                copy_files: Vec::new(),
                 name: "muxterm".into(),
                 // Under the real home so the row's ~-abbreviation applies.
                 path: Some(dirs::home_dir().unwrap().join("dev/muxterm")),
@@ -1334,6 +1445,8 @@ mod tests {
                 subdir: None,
             },
             Project {
+                default_branch: None,
+                copy_files: Vec::new(),
                 name: "a-rather-long-project-name".into(),
                 path: None,
                 repo: Some("herval/some-long-repo-name".into()),
@@ -1675,6 +1788,9 @@ mod tests {
     #[test]
     fn draft_derives_names_and_projects() {
         let draft = ProjectDraft {
+            import: Default::default(),
+            default_branch: String::new(),
+            copy_files: String::new(),
             name: String::new(),
             location: "herval/dotfiles".into(),
             subfolder: String::new(),
@@ -1689,6 +1805,9 @@ mod tests {
         assert_eq!(p.subdir, None, "blank subfolder stays None");
 
         let draft = ProjectDraft {
+            import: Default::default(),
+            default_branch: String::new(),
+            copy_files: String::new(),
             name: "mux".into(),
             location: "~/dev/muxterm/".into(),
             subfolder: String::new(),
@@ -1706,6 +1825,9 @@ mod tests {
         // A subfolder rides into the derived name (repo + folder path)
         // and onto the project, slash-trimmed.
         let draft = ProjectDraft {
+            import: Default::default(),
+            default_branch: String::new(),
+            copy_files: String::new(),
             name: String::new(),
             location: "Telepatia-AI/monobloco".into(),
             subfolder: "/apps/web/".into(),
@@ -1720,6 +1842,8 @@ mod tests {
         assert_eq!(p.subdir.as_deref(), Some("apps/web"));
         // A typed name still wins over the derived one.
         let named = ProjectDraft {
+            default_branch: String::new(),
+            copy_files: String::new(),
             name: "web".into(),
             ..draft
         };
